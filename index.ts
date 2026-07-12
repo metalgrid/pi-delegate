@@ -1,0 +1,1003 @@
+/**
+ * Delegate Tool — Lightweight subagents with auto model selection
+ *
+ * Spawns isolated `pi` processes for delegated tasks.
+ * Models are auto-selected per agent tier from live modelRegistry.
+ *
+ * Modes:
+ *   - Single: { agent: "name", task: "..." }
+ *   - Parallel: { tasks: [{ agent, task, model? }, ...] } (up to 4 concurrent)
+ *   - Background: add { background: true } to return a job ID immediately
+ *
+ * Extensions & Skills:
+ *   - Child processes keep normal extension and skill auto-discovery enabled
+ *   - Nested delegation is background-only and capped at depth 2
+ *
+ * Agents are markdown files in ~/.pi/agent/agents/ with frontmatter:
+ *   name, description, tier (fast|standard|heavy), tools, model (optional override)
+ */
+
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getMarkdownTheme, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+const MAX_CONCURRENCY = 4;
+const PARENT_OUTPUT_CAP_BYTES = 16 * 1024;
+const COLLAPSED_OUTCOME_CAP_BYTES = 2 * 1024;
+const DELEGATE_DEPTH_ENV = "PI_DELEGATE_DEPTH";
+const MAX_DELEGATION_DEPTH = 2;
+
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+type Tier = "fast" | "standard" | "heavy";
+
+interface AgentConfig {
+	name: string;
+	description: string;
+	tier: Tier;
+	tools?: string[];
+	model?: string; // explicit override
+	systemPrompt: string;
+}
+
+interface ResourceInfo {
+	name: string;
+	path: string;
+}
+
+interface UsageStats {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	turns: number;
+}
+
+interface TaskResult {
+	agent: string;
+	task: string;
+	exitCode: number;
+	resolvedModel: string;
+	messages: any[];
+	stderr: string;
+	usage: UsageStats;
+	stopReason?: string;
+	errorMessage?: string;
+}
+
+interface BackgroundJobDetails {
+	id: string;
+	status: "running" | "completed" | "failed" | "aborted";
+	startedAt: number;
+	finishedAt?: number;
+}
+
+interface DelegateDetails {
+	mode: "single" | "parallel";
+	results: TaskResult[];
+	background?: BackgroundJobDetails;
+}
+
+interface BackgroundJob extends BackgroundJobDetails {
+	mode: "single" | "parallel";
+	results: TaskResult[];
+	controller: AbortController;
+}
+
+function getDelegateDepth(): number {
+	const depth = Number.parseInt(process.env[DELEGATE_DEPTH_ENV] ?? "0", 10);
+	return Number.isFinite(depth) && depth >= 0 ? depth : 0;
+}
+
+function makePendingResult(agent: string, task: string, resolvedModel = ""): TaskResult {
+	return {
+		agent,
+		task,
+		exitCode: -1,
+		resolvedModel,
+		messages: [],
+		stderr: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+	};
+}
+
+// ─── Agent discovery ────────────────────────────────────────────────────────
+
+function discoverAgents(): AgentConfig[] {
+	const dir = path.join(getAgentDir(), "agents");
+	if (!fs.existsSync(dir)) return [];
+
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+
+	const agents: AgentConfig[] = [];
+	for (const entry of entries) {
+		if (!entry.name.endsWith(".md") || (!entry.isFile() && !entry.isSymbolicLink())) continue;
+		const filePath = path.join(dir, entry.name);
+		try {
+			var content = fs.readFileSync(filePath, "utf-8");
+		} catch {
+			continue;
+		}
+
+		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		if (!frontmatter?.name) continue;
+
+		const tools = frontmatter.tools
+			?.split(",")
+			.map((t) => t.trim())
+			.filter(Boolean);
+
+		const tier = frontmatter.tier;
+		agents.push({
+			name: frontmatter.name,
+			description: frontmatter.description || "",
+			tier: tier === "fast" || tier === "heavy" ? tier : "standard",
+			tools: tools?.length ? tools : undefined,
+			model: frontmatter.model || undefined,
+			systemPrompt: body.trim(),
+		});
+	}
+	return agents;
+}
+
+// ─── Extension & skill discovery ─────────────────────────────────────────────
+
+function addExtensionsFromDir(dir: string, results: ResourceInfo[]) {
+	if (!fs.existsSync(dir)) return;
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (entry.name === "delegate") continue; // avoid listing this tool as a child resource
+		if (entry.isFile() && entry.name.endsWith(".ts")) {
+			results.push({ name: entry.name.replace(/\.ts$/, ""), path: path.join(dir, entry.name) });
+		} else if (entry.isDirectory() || entry.isSymbolicLink()) {
+			const indexPath = path.join(dir, entry.name, "index.ts");
+			if (fs.existsSync(indexPath)) {
+				results.push({ name: entry.name, path: indexPath });
+			}
+		}
+	}
+}
+
+function discoverExtensions(cwd: string): ResourceInfo[] {
+	const results: ResourceInfo[] = [];
+	const agentDir = getAgentDir();
+	addExtensionsFromDir(path.join(agentDir, "extensions"), results);
+	addExtensionsFromDir(path.join(cwd, ".pi", "extensions"), results);
+	return results;
+}
+
+function addSkillsFromDir(dir: string, results: ResourceInfo[]) {
+	if (!fs.existsSync(dir)) return;
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (entry.isDirectory() || entry.isSymbolicLink()) {
+			if (fs.existsSync(path.join(dir, entry.name, "SKILL.md"))) {
+				results.push({ name: entry.name, path: path.join(dir, entry.name) });
+			}
+		}
+	}
+}
+
+function discoverSkills(cwd: string): ResourceInfo[] {
+	const results: ResourceInfo[] = [];
+	const agentDir = getAgentDir();
+	addSkillsFromDir(path.join(agentDir, "skills"), results);
+	addSkillsFromDir(path.join(cwd, ".pi", "skills"), results);
+	return results;
+}
+
+// ─── Model resolution ───────────────────────────────────────────────────────
+//
+// Scores models by capability (cost → context window → reasoning).
+// Then picks: fast=cheapest, standard=median, heavy=most capable+reasoning.
+
+function capabilityScore(m: any): number {
+	const costTotal = (m.cost?.input ?? 0) + (m.cost?.output ?? 0);
+	const contextNorm = (m.contextWindow ?? 128000) / 1000;
+	const reasoningBonus = m.reasoning ? 50 : 0;
+
+	// Subscription models (cost=0): rank by context + reasoning
+	if (costTotal === 0) return contextNorm + reasoningBonus;
+
+	// Paid models: cost dominates, reasoning as tiebreaker
+	return costTotal * 100 + reasoningBonus;
+}
+
+function resolveModelForTier(
+	available: any[],
+	tier: Tier,
+	fallback?: string,
+): string {
+	if (available.length === 0) return fallback ?? "";
+
+	const sorted = [...available].sort((a, b) => capabilityScore(a) - capabilityScore(b));
+
+	let picked: any;
+	if (tier === "fast") {
+		const nonReasoning = sorted.filter((m) => !m.reasoning);
+		picked = nonReasoning[0] ?? sorted[0];
+	} else if (tier === "heavy") {
+		const reasoning = sorted.filter((m) => m.reasoning);
+		picked = reasoning.length > 0 ? reasoning[reasoning.length - 1] : sorted[sorted.length - 1];
+	} else {
+		// standard: median
+		picked = sorted[Math.floor(sorted.length / 2)];
+	}
+
+	return `${picked.provider}/${picked.id}`;
+}
+
+// ─── Formatting helpers ─────────────────────────────────────────────────────
+
+function fmtTokens(n: number): string {
+	if (n < 1000) return String(n);
+	if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
+	return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+function fmtUsage(u: UsageStats, model?: string): string {
+	const p: string[] = [];
+	if (u.turns) p.push(`${u.turns}t`);
+	if (u.input) p.push(`↑${fmtTokens(u.input)}`);
+	if (u.output) p.push(`↓${fmtTokens(u.output)}`);
+	if (u.cacheRead) p.push(`R${fmtTokens(u.cacheRead)}`);
+	if (u.cacheWrite) p.push(`W${fmtTokens(u.cacheWrite)}`);
+	if (u.cost) p.push(`$${u.cost.toFixed(4)}`);
+	if (model) p.push(model);
+	return p.join(" ");
+}
+
+function shortPath(p: string): string {
+	const home = os.homedir();
+	return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+}
+
+function fmtToolCall(name: string, args: Record<string, any>, fg: (c: any, t: string) => string): string {
+	const cmd = (s: string, max = 60) => (s.length > max ? s.slice(0, max) + "…" : s);
+	switch (name) {
+		case "bash":
+			return fg("muted", "$ ") + fg("toolOutput", cmd(args.command || "..."));
+		case "read":
+			return fg("muted", "read ") + fg("accent", shortPath((args.path || args.file_path || "...") as string));
+		case "write":
+			return fg("muted", "write ") + fg("accent", shortPath((args.path || args.file_path || "...") as string));
+		case "edit":
+			return fg("muted", "edit ") + fg("accent", shortPath((args.path || args.file_path || "...") as string));
+		case "grep":
+			return (
+				fg("muted", "grep ") +
+				fg("accent", `/${args.pattern || ""}/`) +
+				fg("dim", ` in ${shortPath((args.path || ".") as string)}`)
+			);
+		case "find":
+			return fg("muted", "find ") + fg("accent", (args.pattern || "*") as string);
+		case "ls":
+			return fg("muted", "ls ") + fg("accent", shortPath((args.path || ".") as string));
+		default:
+			return fg("accent", name);
+	}
+}
+
+// ─── Display helpers ────────────────────────────────────────────────────────
+
+type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
+
+function getDisplayItems(messages: any[]): DisplayItem[] {
+	const items: DisplayItem[] = [];
+	for (const msg of messages) {
+		if (msg.role !== "assistant") continue;
+		for (const part of msg.content) {
+			if (part.type === "text" && part.text.trim()) items.push({ type: "text", text: part.text });
+			else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
+		}
+	}
+	return items;
+}
+
+function getFinalOutput(messages: any[]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i].role === "assistant") {
+			for (const part of messages[i].content) {
+				if (part.type === "text") return part.text;
+			}
+		}
+	}
+	return "";
+}
+
+function isFailedResult(r: TaskResult): boolean {
+	if (r.exitCode === -1) {
+		return r.stopReason === "error" || r.stopReason === "aborted" || Boolean(r.errorMessage);
+	}
+	return r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted" || Boolean(r.errorMessage);
+}
+
+function fmtBytes(n: number): string {
+	if (n < 1024) return `${n} B`;
+	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+	return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function truncateForParent(text: string, maxBytes = PARENT_OUTPUT_CAP_BYTES): string {
+	const totalBytes = Buffer.byteLength(text, "utf8");
+	if (totalBytes <= maxBytes) return text;
+
+	let lo = 0;
+	let hi = text.length;
+	while (lo < hi) {
+		const mid = Math.floor((lo + hi + 1) / 2);
+		if (Buffer.byteLength(text.slice(0, mid), "utf8") <= maxBytes) lo = mid;
+		else hi = mid - 1;
+	}
+
+	const prefix = text.slice(0, lo).trimEnd();
+	const shownBytes = Buffer.byteLength(prefix, "utf8");
+	return `${prefix}\n\n[Delegate output truncated: ${fmtBytes(totalBytes - shownBytes)} omitted. Full child transcript remains in tool details.]`;
+}
+
+function getOutcomeForParent(r: TaskResult, maxBytes = PARENT_OUTPUT_CAP_BYTES): string {
+	if (isFailedResult(r)) {
+		const reason = r.stopReason || (r.exitCode !== 0 ? `exit ${r.exitCode}` : "error");
+		const msg = (r.errorMessage || r.stderr || getFinalOutput(r.messages) || "(no output)").trim();
+		return truncateForParent(`Agent ${r.agent} failed (${reason}):\n${msg}`, maxBytes);
+	}
+	return truncateForParent((getFinalOutput(r.messages) || "(no output)").trim(), maxBytes);
+}
+
+function getCollapsedOutcome(r: TaskResult): string {
+	if (r.exitCode === -1) return "(running…)";
+	return getOutcomeForParent(r, COLLAPSED_OUTCOME_CAP_BYTES);
+}
+
+function getParallelOutcome(results: TaskResult[]): string {
+	const ok = results.filter((r) => !isFailedResult(r)).length;
+	const perTaskOutputCap = Math.max(1024, Math.floor(PARENT_OUTPUT_CAP_BYTES / Math.max(results.length, 1)));
+	const outcomes = results.map((r) => {
+		const status = isFailedResult(r) ? "failed" : "succeeded";
+		return `### [${r.agent}] ${status}\n\n${getOutcomeForParent(r, perTaskOutputCap)}`;
+	});
+	return truncateForParent(`Parallel: ${ok}/${results.length} succeeded\n\n${outcomes.join("\n\n---\n\n")}`);
+}
+
+// ─── Process spawning ───────────────────────────────────────────────────────
+
+function getPiInvocation(extraArgs: string[]): { command: string; args: string[] } {
+	const currentScript = process.argv[1];
+	const isBunVirtual = currentScript?.startsWith("/$bunfs/root/");
+	if (currentScript && !isBunVirtual && fs.existsSync(currentScript)) {
+		return { command: process.execPath, args: [currentScript, ...extraArgs] };
+	}
+	const execName = path.basename(process.execPath).toLowerCase();
+	if (!/^(node|bun)(\.exe)?$/.test(execName)) {
+		return { command: process.execPath, args: extraArgs };
+	}
+	return { command: "pi", args: extraArgs };
+}
+
+async function runAgent(
+	cwd: string,
+	agents: AgentConfig[],
+	agentName: string,
+	task: string,
+	modelId: string,
+	signal: AbortSignal | undefined,
+	onUpdate: ((partial: any) => void) | undefined,
+	makeDetails: (results: TaskResult[]) => DelegateDetails,
+): Promise<TaskResult> {
+	const agent = agents.find((a) => a.name === agentName);
+	if (!agent) {
+		const names = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		return {
+			agent: agentName,
+			task,
+			exitCode: 1,
+			resolvedModel: modelId,
+			messages: [],
+			stderr: `Unknown agent "${agentName}". Available: ${names}`,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+		};
+	}
+
+	// Keep normal extension and skill discovery enabled. The child enforces the
+	// bounded, background-only nesting policy from PI_DELEGATE_DEPTH.
+	const args = ["--mode", "json", "-p", "--no-session"];
+	if (modelId) args.push("--model", modelId);
+	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
+
+	// Write system prompt to temp file for --append-system-prompt
+	let tmpDir: string | null = null;
+
+	const result: TaskResult = {
+		agent: agentName,
+		task,
+		exitCode: -1,
+		resolvedModel: modelId,
+		messages: [],
+		stderr: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+	};
+
+	const emit = () => {
+		onUpdate?.({
+			content: [{ type: "text", text: `Agent ${agentName} running…` }],
+			details: makeDetails([result]),
+		});
+	};
+
+	try {
+		if (agent.systemPrompt) {
+			tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-delegate-"));
+			const tmpPath = path.join(tmpDir, "system-prompt.md");
+			await fs.promises.writeFile(tmpPath, agent.systemPrompt, { mode: 0o600 });
+			args.push("--append-system-prompt", tmpPath);
+		}
+
+		args.push(`Task: ${task}`);
+
+		let wasAborted = false;
+		const exitCode = await new Promise<number>((resolve) => {
+			const inv = getPiInvocation(args);
+			const proc = spawn(inv.command, inv.args, {
+				cwd,
+				env: { ...process.env, [DELEGATE_DEPTH_ENV]: String(getDelegateDepth() + 1) },
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let buf = "";
+			let closed = false;
+
+			const processLine = (line: string) => {
+				if (!line.trim()) return;
+				let ev: any;
+				try {
+					ev = JSON.parse(line);
+				} catch {
+					return;
+				}
+
+				if (ev.type === "message_end" && ev.message) {
+					result.messages.push(ev.message);
+					const msg = ev.message;
+					if (msg.role === "assistant") {
+						result.usage.turns++;
+						if (msg.usage) {
+							result.usage.input += msg.usage.input || 0;
+							result.usage.output += msg.usage.output || 0;
+							result.usage.cacheRead += msg.usage.cacheRead || 0;
+							result.usage.cacheWrite += msg.usage.cacheWrite || 0;
+							result.usage.cost += msg.usage.cost?.total || 0;
+						}
+						if (msg.model) result.resolvedModel = msg.provider ? `${msg.provider}/${msg.model}` : msg.model;
+						if (msg.stopReason) result.stopReason = msg.stopReason;
+						if (msg.errorMessage) result.errorMessage = msg.errorMessage;
+					}
+					emit();
+				}
+				if (ev.type === "tool_result_end" && ev.message) {
+					result.messages.push(ev.message);
+					emit();
+				}
+			};
+
+			proc.stdout.on("data", (d: Buffer) => {
+				buf += d.toString();
+				const lines = buf.split("\n");
+				buf = lines.pop() || "";
+				for (const l of lines) processLine(l);
+			});
+			proc.stderr.on("data", (d: Buffer) => {
+				result.stderr += d.toString();
+			});
+			proc.on("close", (code) => {
+				closed = true;
+				if (buf.trim()) processLine(buf);
+				resolve(code ?? 0);
+			});
+			proc.on("error", (err) => {
+				result.errorMessage = err.message;
+				resolve(1);
+			});
+
+			if (signal) {
+				const kill = () => {
+					wasAborted = true;
+					proc.kill("SIGTERM");
+					const killTimer = setTimeout(() => {
+						if (!closed) proc.kill("SIGKILL");
+					}, 5000);
+					(killTimer as any).unref?.();
+				};
+				if (signal.aborted) kill();
+				else signal.addEventListener("abort", kill, { once: true });
+			}
+		});
+
+		result.exitCode = wasAborted ? 1 : exitCode;
+		if (wasAborted) {
+			result.stopReason = "aborted";
+			result.errorMessage ||= "Aborted";
+		}
+		return result;
+	} finally {
+		if (tmpDir) await fs.promises.rm(tmpDir, { recursive: true, force: true });
+	}
+}
+
+// ─── Concurrency helper ─────────────────────────────────────────────────────
+
+async function mapConcurrent<T, R>(items: T[], n: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
+	if (!items.length) return [];
+	const limit = Math.max(1, Math.min(n, items.length));
+	const results: R[] = new Array(items.length);
+	let next = 0;
+	await Promise.all(
+		Array.from({ length: limit }, async () => {
+			while (true) {
+				const i = next++;
+				if (i >= items.length) return;
+				results[i] = await fn(items[i], i);
+			}
+		}),
+	);
+	return results;
+}
+
+// ─── Tool parameter schema ──────────────────────────────────────────────────
+
+const TaskItem = Type.Object({
+	agent: Type.String({ description: "Agent name" }),
+	task: Type.String({ description: "Task description" }),
+	model: Type.Optional(Type.String({ description: "Model override for this task (e.g. 'provider/model-id')." })),
+});
+
+const DelegateParams = Type.Object({
+	agent: Type.Optional(Type.String({ description: "Agent name for single mode" })),
+	task: Type.Optional(Type.String({ description: "Task for single mode" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Tasks for parallel mode; runs up to 4 concurrently and queues the rest" })),
+	model: Type.Optional(Type.String({ description: "Default model override for this invocation (e.g. 'provider/model-id')." })),
+	background: Type.Optional(Type.Boolean({ description: "Start work in the background and return a job ID immediately." })),
+});
+
+const DelegateStatusParams = Type.Object({
+	jobId: Type.Optional(Type.String({ description: "Background job ID. Omit to list jobs in this session." })),
+});
+
+// ─── Extension ──────────────────────────────────────────────────────────────
+
+export default function (pi: ExtensionAPI) {
+	const depth = getDelegateDepth();
+	if (depth >= MAX_DELEGATION_DEPTH) return;
+
+	const backgroundJobs = new Map<string, BackgroundJob>();
+	let acceptingBackgroundCompletions = true;
+
+	const toDetails = (job: BackgroundJob): DelegateDetails => ({
+		mode: job.mode,
+		results: job.results.map((result) => ({ ...result, messages: [...result.messages], usage: { ...result.usage } })),
+		background: {
+			id: job.id,
+			status: job.status,
+			startedAt: job.startedAt,
+			finishedAt: job.finishedAt,
+		},
+	});
+
+	const backgroundSummary = (job: BackgroundJob) =>
+		job.mode === "single" ? getOutcomeForParent(job.results[0]) : getParallelOutcome(job.results);
+
+	pi.on("session_shutdown", () => {
+		acceptingBackgroundCompletions = false;
+		for (const job of backgroundJobs.values()) job.controller.abort();
+		backgroundJobs.clear();
+	});
+
+	pi.registerTool({
+		name: "delegate",
+		label: "Delegate",
+		description: [
+			"Delegate tasks to specialized subagents with isolated context.",
+			"Modes: single (agent + task) or parallel (tasks array, max 4 concurrent; extra tasks are queued).",
+			"Each parallel task may specify its own model; a top-level model is the default for tasks without one.",
+			"Set background: true to start work without blocking; it returns a job ID and auto-reports completion to the parent session.",
+			"Nested delegation is background-only and capped at two levels.",
+		].join(" "),
+		promptSnippet: "Delegate tasks to specialized subagents with isolated context",
+		promptGuidelines: [
+			"Use delegate to run subtasks in isolated context windows.",
+			"Use scout for quick codebase lookups, worker for code changes, architect for deep analysis.",
+			"Use parallel mode when multiple tasks are independent; tasks beyond the concurrency limit are queued.",
+			"Set tasks[].model to choose a model for a specific parallel task; use top-level model as the batch default.",
+			"Set delegate background: true when work can continue before the delegated result is needed; it will signal completion automatically.",
+		],
+		parameters: DelegateParams,
+
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const agents = discoverAgents();
+			const available = ctx.modelRegistry.getAvailable();
+			const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+			const extList = discoverExtensions(ctx.cwd);
+			const skillList = discoverSkills(ctx.cwd);
+			const tierModel = new Map<Tier, string>();
+			for (const tier of ["fast", "standard", "heavy"] as Tier[]) {
+				tierModel.set(tier, resolveModelForTier(available, tier, fallback));
+			}
+
+			const defaultModel = params.model?.trim() || "";
+			function modelFor(agentName: string, taskModel?: string): string {
+				if (taskModel?.trim()) return taskModel.trim();
+				if (defaultModel) return defaultModel;
+				const agent = agents.find((candidate) => candidate.name === agentName);
+				return agent?.model || (agent ? tierModel.get(agent.tier) : undefined) || fallback;
+			}
+
+			const hasSingle = Boolean(params.agent && params.task);
+			const hasParallel = (params.tasks?.length ?? 0) > 0;
+			const mode = hasSingle ? "single" : "parallel";
+			const mkDetails = (results: TaskResult[], background?: BackgroundJobDetails): DelegateDetails => ({ mode, results, background });
+
+			if (hasSingle && hasParallel) {
+				return { content: [{ type: "text", text: "Provide either agent+task or tasks, not both." }], details: mkDetails([]) };
+			}
+
+			if (!hasSingle && !hasParallel) {
+				const agentList = agents.map((agent) => `  ${agent.name} (${agent.tier}): ${agent.description}`).join("\n") || "No agents in ~/.pi/agent/agents/*.md";
+				const extNames = extList.map((extension) => `  ${extension.name}`).join("\n") || "  (none)";
+				const skillNames = skillList.map((skill) => `  ${skill.name}`).join("\n") || "  (none)";
+				return {
+					content: [{ type: "text", text: `Provide agent+task or tasks array.\n\nAvailable agents:\n${agentList}\n\nAvailable extensions:\n${extNames}\n\nAvailable skills:\n${skillNames}` }],
+					details: mkDetails([]),
+				};
+			}
+
+			if (depth > 0 && !params.background) {
+				return {
+					content: [{ type: "text", text: "Nested delegation must use background: true (maximum depth is 2)." }],
+					details: mkDetails([]),
+				};
+			}
+
+			const tasks = params.tasks ?? [];
+			const initialResults = hasSingle
+				? [makePendingResult(params.agent!, params.task!, modelFor(params.agent!))]
+				: tasks.map((task) => makePendingResult(task.agent, task.task, modelFor(task.agent, task.model)));
+
+			const runTask = async (
+				agent: string,
+				task: string,
+				model: string,
+				runSignal: AbortSignal | undefined,
+				onTaskUpdate: (result: TaskResult) => void,
+			): Promise<TaskResult> => {
+				try {
+					const result = await runAgent(ctx.cwd, agents, agent, task, model, runSignal, (partial: any) => {
+						const update = partial.details?.results[0] as TaskResult | undefined;
+						if (update) onTaskUpdate(update);
+					}, (results) => mkDetails(results));
+					onTaskUpdate(result);
+					return result;
+				} catch (error) {
+					const failed = makePendingResult(agent, task, model);
+					failed.exitCode = 1;
+					failed.errorMessage = error instanceof Error ? error.message : String(error);
+					onTaskUpdate(failed);
+					return failed;
+				}
+			};
+
+			const runParallel = async (
+				results: TaskResult[],
+				runSignal: AbortSignal | undefined,
+				onProgress?: () => void,
+			): Promise<TaskResult[]> =>
+				mapConcurrent(tasks, MAX_CONCURRENCY, async (task, index) => {
+					const result = await runTask(task.agent, task.task, modelFor(task.agent, task.model), runSignal, (update) => {
+						results[index] = update;
+						onProgress?.();
+					});
+					return result;
+				});
+
+			if (params.background) {
+				const id = `delegate-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+				const job: BackgroundJob = {
+					id,
+					mode,
+					status: "running",
+					startedAt: Date.now(),
+					results: initialResults,
+					controller: new AbortController(),
+				};
+				backgroundJobs.set(id, job);
+
+				void (async () => {
+					if (hasSingle) {
+						job.results[0] = await runTask(params.agent!, params.task!, modelFor(params.agent!), job.controller.signal, (update) => {
+							job.results[0] = update;
+						});
+					} else {
+						job.results = await runParallel(job.results, job.controller.signal);
+					}
+					job.status = job.controller.signal.aborted ? "aborted" : job.results.every((result) => !isFailedResult(result)) ? "completed" : "failed";
+					job.finishedAt = Date.now();
+
+					if (!acceptingBackgroundCompletions) return;
+					try {
+						pi.sendMessage(
+							{
+								customType: "delegate-background",
+								content: `Background job ${job.id} ${job.status}.\n\n${backgroundSummary(job)}`,
+								display: true,
+								details: toDetails(job),
+							},
+							{ deliverAs: "steer", triggerTurn: true },
+						);
+					} catch {
+						// The parent session may have ended between the completion check and injection.
+					}
+				})();
+
+				return {
+					content: [{ type: "text", text: `Started background job ${job.id}. It will auto-report when complete; use delegate_status with this job ID to inspect it.` }],
+					details: toDetails(job),
+				};
+			}
+
+			if (hasSingle) {
+				const result = await runTask(params.agent!, params.task!, modelFor(params.agent!), signal, (update) => onUpdate?.({
+					content: [{ type: "text", text: `Agent ${params.agent} running…` }],
+					details: mkDetails([update]),
+				}));
+				return {
+					content: [{ type: "text", text: getOutcomeForParent(result) }],
+					details: mkDetails([result]),
+					isError: isFailedResult(result) || undefined,
+				};
+			}
+
+			const allResults = initialResults;
+			const emitParallelProgress = () => {
+				if (!onUpdate) return;
+				const completed = allResults.filter((result) => result.exitCode !== -1).length;
+				onUpdate({
+					content: [{ type: "text", text: `Parallel: ${completed}/${allResults.length} done, ${allResults.length - completed} running…` }],
+					details: mkDetails([...allResults]),
+				});
+			};
+			const results = await runParallel(allResults, signal, emitParallelProgress);
+			const succeeded = results.filter((result) => !isFailedResult(result)).length;
+			return {
+				content: [{ type: "text", text: getParallelOutcome(results) }],
+				details: mkDetails(results),
+				isError: succeeded !== results.length || undefined,
+			};
+		},
+
+		// ── Render call ────────────────────────────────────────────────────
+
+		renderCall(args, theme) {
+			const tasks = args.tasks;
+			if (tasks?.length) {
+				let t = theme.fg("toolTitle", theme.bold("delegate ")) + theme.fg("accent", `parallel (${tasks.length})`);
+				if (args.background) t += theme.fg("warning", " background");
+				for (const task of tasks.slice(0, 3)) {
+					const p = task.task.length > 40 ? task.task.slice(0, 40) + "…" : task.task;
+					t += `\n  ${theme.fg("accent", task.agent)}${theme.fg("dim", ` ${p}`)}`;
+				}
+				if (tasks.length > 3) t += `\n  ${theme.fg("muted", `… +${tasks.length - 3} more`)}`;
+				return new Text(t, 0, 0);
+			}
+			const name = args.agent || "…";
+			const p = args.task ? (args.task.length > 60 ? args.task.slice(0, 60) + "…" : args.task) : "…";
+			const background = args.background ? theme.fg("warning", " background") : "";
+			return new Text(theme.fg("toolTitle", theme.bold("delegate ")) + theme.fg("accent", name) + background + `\n  ${theme.fg("dim", p)}`, 0, 0);
+		},
+
+		// ── Render result ──────────────────────────────────────────────────
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as DelegateDetails | undefined;
+			if (!details?.results.length) {
+				const t = result.content[0];
+				return new Text(t?.type === "text" ? t.text : "(no output)", 0, 0);
+			}
+
+			const mdTheme = getMarkdownTheme();
+
+			const aggUsage = (results: TaskResult[]) => {
+				const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+				for (const r of results) {
+					u.input += r.usage.input;
+					u.output += r.usage.output;
+					u.cacheRead += r.usage.cacheRead;
+					u.cacheWrite += r.usage.cacheWrite;
+					u.cost += r.usage.cost;
+					u.turns += r.usage.turns;
+				}
+				return u;
+			};
+
+			// ── Single ─────────────────────────────────────────────────────
+
+			if (details.mode === "single" && details.results.length === 1) {
+				const r = details.results[0];
+				const running = r.exitCode === -1;
+				const failed = isFailedResult(r);
+				const icon = running ? theme.fg("warning", "⏳") : failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const items = getDisplayItems(r.messages);
+				const output = getFinalOutput(r.messages);
+
+				if (expanded) {
+					const c = new Container();
+					let h = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
+					if (details.background) h += theme.fg("warning", ` [${details.background.id}]`);
+					if (r.resolvedModel) h += theme.fg("dim", ` → ${r.resolvedModel}`);
+					if (failed && r.stopReason) h += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+					c.addChild(new Text(h, 0, 0));
+					if (failed && r.errorMessage) c.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+					c.addChild(new Spacer(1));
+					c.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+					c.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+					c.addChild(new Spacer(1));
+					c.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
+					for (const item of items) {
+						if (item.type === "toolCall")
+							c.addChild(
+								new Text(theme.fg("muted", "→ ") + fmtToolCall(item.name, item.args, theme.fg.bind(theme)), 0, 0),
+							);
+					}
+					if (output) {
+						c.addChild(new Spacer(1));
+						c.addChild(new Markdown(output.trim(), 0, 0, mdTheme));
+					}
+					const u = fmtUsage(r.usage, r.resolvedModel);
+					if (u) {
+						c.addChild(new Spacer(1));
+						c.addChild(new Text(theme.fg("dim", u), 0, 0));
+					}
+					return c;
+				}
+
+				// Collapsed: final outcome/status only. Expand to inspect child transcript.
+				let t = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
+				if (details.background) t += theme.fg("warning", ` [${details.background.id}]`);
+				if (r.resolvedModel) t += theme.fg("dim", ` → ${r.resolvedModel}`);
+				const outcomeColor = running ? "muted" : failed ? "error" : "toolOutput";
+				t += `\n${theme.fg(outcomeColor, getCollapsedOutcome(r))}`;
+				const u = fmtUsage(r.usage);
+				if (u) t += `\n${theme.fg("dim", u)}`;
+				if (items.length || output) t += `\n${theme.fg("muted", "(Ctrl+O to show child transcript)")}`;
+				return new Text(t, 0, 0);
+			}
+
+			// ── Parallel ───────────────────────────────────────────────────
+
+			const results = details.results;
+			const running = results.filter((r) => r.exitCode === -1).length;
+			const succeeded = results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
+			const failedN = results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
+			const isRunning = running > 0;
+			const icon = isRunning ? theme.fg("warning", "⏳") : failedN ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+			const status = isRunning
+				? `${succeeded + failedN}/${results.length} done, ${running} running`
+				: `${succeeded}/${results.length}`;
+
+			if (expanded && !isRunning) {
+				const c = new Container();
+				c.addChild(new Text(`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`, 0, 0));
+
+				for (const r of results) {
+					const ri = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					const items = getDisplayItems(r.messages);
+					const output = getFinalOutput(r.messages);
+
+					c.addChild(new Spacer(1));
+					c.addChild(
+						new Text(
+							`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${ri}${theme.fg("dim", ` → ${r.resolvedModel}`)}`,
+							0,
+							0,
+						),
+					);
+					c.addChild(new Text(theme.fg("dim", r.task), 0, 0));
+					for (const item of items) {
+						if (item.type === "toolCall")
+							c.addChild(
+								new Text(theme.fg("muted", "→ ") + fmtToolCall(item.name, item.args, theme.fg.bind(theme)), 0, 0),
+							);
+					}
+					if (output) {
+						c.addChild(new Spacer(1));
+						c.addChild(new Markdown(output.trim(), 0, 0, mdTheme));
+					}
+					const su = fmtUsage(r.usage);
+					if (su) c.addChild(new Text(theme.fg("dim", su), 0, 0));
+				}
+
+				const total = fmtUsage(aggUsage(results));
+				if (total) {
+					c.addChild(new Spacer(1));
+					c.addChild(new Text(theme.fg("dim", `Total: ${total}`), 0, 0));
+				}
+				return c;
+			}
+
+			// Collapsed parallel: final outcomes/status only. Expand to inspect child transcripts.
+			let t = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
+			if (details.background) t += theme.fg("warning", ` [${details.background.id}]`);
+			for (const r of results) {
+				const rRunning = r.exitCode === -1;
+				const rFailed = isFailedResult(r);
+				const ri = rRunning ? theme.fg("warning", "⏳") : rFailed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const outcomeColor = rRunning ? "muted" : rFailed ? "error" : "toolOutput";
+				t += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${ri}${theme.fg("dim", ` → ${r.resolvedModel}`)}`;
+				t += `\n${theme.fg(outcomeColor, getCollapsedOutcome(r))}`;
+			}
+			if (!isRunning) {
+				const total = fmtUsage(aggUsage(results));
+				if (total) t += `\n\n${theme.fg("dim", `Total: ${total}`)}`;
+			}
+			if (!expanded) t += `\n${theme.fg("muted", "(Ctrl+O to show child transcripts)")}`;
+			return new Text(t, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "delegate_status",
+		label: "Delegate Status",
+		description: "Inspect active or completed background delegate jobs by ID. Omit jobId to list jobs started in this session.",
+		promptSnippet: "Inspect a background delegate job's status and result",
+		promptGuidelines: [
+			"Use delegate_status to inspect a background delegate job when its ID is known or its auto-reported result needs more detail.",
+		],
+		parameters: DelegateStatusParams,
+		async execute(_id, params) {
+			if (params.jobId && !backgroundJobs.has(params.jobId)) {
+				return {
+					content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }],
+					details: { jobs: [] },
+					isError: true,
+				};
+			}
+
+			const jobs = params.jobId ? [backgroundJobs.get(params.jobId)!] : [...backgroundJobs.values()];
+			if (jobs.length === 0) {
+				return { content: [{ type: "text", text: "No background delegate jobs in this session." }], details: { jobs: [] } };
+			}
+
+			const text = jobs
+				.map((job) => {
+					const outcome = job.status === "running" ? "(running…)" : backgroundSummary(job);
+					return `### ${job.id} — ${job.status}\n\n${outcome}`;
+				})
+				.join("\n\n---\n\n");
+			return {
+				content: [{ type: "text", text: truncateForParent(text) }],
+				details: { jobs: jobs.map(toDetails) },
+			};
+		},
+	});
+}
