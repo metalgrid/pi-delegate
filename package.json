@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "Delegate pi tasks to isolated subagents with parallel and background execution",
+  "author": "Iskren Hadzhinedev <iso@axtroz.dev>",
+  "license": "MIT",
   "type": "module",
   "files": [
     "index.ts",
