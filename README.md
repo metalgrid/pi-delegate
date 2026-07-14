@@ -133,6 +133,14 @@ Inspect one background job:
 
 Omit `jobId` to list all jobs started in the current session. Jobs are session-scoped and are aborted when that session shuts down.
 
+Interactive job viewer:
+
+```text
+/delegate:tasks
+```
+
+Use `↑`/`↓` and Enter to select a job and view its live child output. In the output view, use `↑`/`↓`, Page Up/Down, Home/End to scroll; Escape or Left returns to the list, and Escape from the list closes the modal. The viewer is read-only: it never sends input to or cancels a child session.
+
 ## How it works
 
 Children inherit the parent's working directory, environment, normal extension discovery, and skill discovery. They run in JSON mode without saving a session. The selected agent prompt is written to a permission-restricted temporary file and passed through `--append-system-prompt`; the file is removed when the child exits.

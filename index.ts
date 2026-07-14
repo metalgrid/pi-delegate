@@ -22,9 +22,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, getMarkdownTheme, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import {
+	Container,
+	Markdown,
+	matchesKey,
+	Spacer,
+	Text,
+	truncateToWidth,
+	type TUI,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -381,6 +391,305 @@ function getParallelOutcome(results: TaskResult[]): string {
 		return `### [${r.agent}] ${status}\n\n${getOutcomeForParent(r, perTaskOutputCap)}`;
 	});
 	return truncateForParent(`Parallel: ${ok}/${results.length} succeeded\n\n${outcomes.join("\n\n---\n\n")}`);
+}
+
+type JobViewerTone = "text" | "accent" | "muted" | "dim" | "warning" | "success" | "error";
+
+type JobViewerLine = {
+	text: string;
+	tone: JobViewerTone;
+};
+
+function getJobStatusTone(status: BackgroundJobDetails["status"]): JobViewerTone {
+	if (status === "completed") return "success";
+	if (status === "failed") return "error";
+	if (status === "aborted") return "warning";
+	return "warning";
+}
+
+function getJobStatusIcon(status: BackgroundJobDetails["status"]): string {
+	if (status === "completed") return "✓";
+	if (status === "failed") return "✗";
+	if (status === "aborted") return "■";
+	return "⏳";
+}
+
+function formatElapsed(startedAt: number, finishedAt?: number): string {
+	const seconds = Math.max(0, Math.floor(((finishedAt ?? Date.now()) - startedAt) / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	return `${minutes}m ${seconds % 60}s`;
+}
+
+function addJobViewerBlock(lines: JobViewerLine[], text: string, tone: JobViewerTone, prefix = ""): void {
+	const normalized = text.replace(/\r\n?/g, "\n");
+	for (const line of normalized.split("\n")) lines.push({ text: prefix + line, tone });
+}
+
+function getJobViewerLines(job: BackgroundJob): JobViewerLine[] {
+	const lines: JobViewerLine[] = [];
+	for (const [index, result] of job.results.entries()) {
+		if (index > 0) lines.push({ text: "", tone: "dim" });
+
+		const failed = isFailedResult(result);
+		const running = result.exitCode === -1;
+		const status = running ? "running" : failed ? "failed" : "completed";
+		const tone = running ? "warning" : failed ? "error" : "success";
+		const icon = running ? "⏳" : failed ? "✗" : "✓";
+		lines.push({ text: `${icon} ${result.agent} · ${status}`, tone });
+		addJobViewerBlock(lines, `Task: ${result.task}`, "dim");
+
+		let hasOutput = false;
+		for (const message of result.messages) {
+			if (message.role === "assistant") {
+				for (const part of Array.isArray(message.content) ? message.content : []) {
+					if (part.type === "toolCall") {
+						hasOutput = true;
+						lines.push({
+							text: `→ ${fmtToolCall(part.name, part.arguments ?? {}, (_color: any, text: string) => text)}`,
+							tone: "muted",
+						});
+					} else if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+						hasOutput = true;
+						addJobViewerBlock(lines, part.text, "text", "  ");
+					}
+				}
+			} else if (message.role === "toolResult") {
+				const tone: JobViewerTone = message.isError ? "error" : "muted";
+				const textParts = (Array.isArray(message.content) ? message.content : [])
+					.filter((part: any) => part.type === "text" && typeof part.text === "string")
+					.map((part: any) => part.text as string);
+				if (textParts.length > 0) {
+					hasOutput = true;
+					lines.push({ text: `← ${message.toolName || "tool"}:`, tone });
+					for (const text of textParts) addJobViewerBlock(lines, text, tone, "  ");
+				}
+			}
+		}
+
+		if (failed && result.errorMessage) addJobViewerBlock(lines, `Error: ${result.errorMessage}`, "error");
+		if (failed && result.stderr.trim()) addJobViewerBlock(lines, `stderr: ${result.stderr.trim()}`, "error");
+		if (running && !hasOutput) lines.push({ text: "(waiting for child output…)", tone: "muted" });
+		if (!running && !hasOutput && !result.errorMessage && !result.stderr.trim()) lines.push({ text: "(no output)", tone: "muted" });
+
+		const usage = fmtUsage(result.usage, result.resolvedModel);
+		if (usage) lines.push({ text: usage, tone: "dim" });
+	}
+
+	if (lines.length === 0) lines.push({ text: "(waiting for child output…)", tone: "muted" });
+	return lines;
+}
+
+class BackgroundJobsViewer {
+	private readonly tui: TUI;
+	private readonly theme: Theme;
+	private readonly getJobs: () => BackgroundJob[];
+	private readonly done: () => void;
+	private readonly refreshTimer: ReturnType<typeof setInterval>;
+	private selectedIndex = 0;
+	private view: "list" | "output" = "list";
+	private outputOffset = 0;
+	private followOutput = true;
+	private closed = false;
+
+	constructor(tui: TUI, theme: Theme, getJobs: () => BackgroundJob[], done: () => void) {
+		this.tui = tui;
+		this.theme = theme;
+		this.getJobs = getJobs;
+		this.done = done;
+		this.refreshTimer = setInterval(() => this.tui.requestRender(), 250);
+		(this.refreshTimer as any).unref?.();
+	}
+
+	handleInput(data: string): void {
+		if (matchesKey(data, "ctrl+c")) {
+			this.close();
+			return;
+		}
+		if (matchesKey(data, "escape")) {
+			if (this.view === "output") {
+				this.view = "list";
+				this.outputOffset = 0;
+				this.followOutput = true;
+				this.tui.requestRender();
+			} else {
+				this.close();
+			}
+			return;
+		}
+
+		if (this.view === "list") {
+			const jobs = this.getJobs();
+			if (jobs.length === 0) return;
+			if (matchesKey(data, "up") || matchesKey(data, "ctrl+k")) {
+				this.selectedIndex = this.selectedIndex === 0 ? jobs.length - 1 : this.selectedIndex - 1;
+				this.tui.requestRender();
+			} else if (matchesKey(data, "down") || matchesKey(data, "ctrl+j")) {
+				this.selectedIndex = (this.selectedIndex + 1) % jobs.length;
+				this.tui.requestRender();
+			} else if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+				this.view = "output";
+				this.outputOffset = 0;
+				this.followOutput = true;
+				this.tui.requestRender();
+			}
+			return;
+		}
+
+		if (matchesKey(data, "left") || matchesKey(data, "backspace")) {
+			this.view = "list";
+			this.outputOffset = 0;
+			this.followOutput = true;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "up") || matchesKey(data, "ctrl+k")) {
+			this.outputOffset = Math.max(0, this.outputOffset - 1);
+			this.followOutput = false;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "down") || matchesKey(data, "ctrl+j")) {
+			this.outputOffset++;
+			this.followOutput = false;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "pageup")) {
+			this.outputOffset = Math.max(0, this.outputOffset - this.getOutputViewportLines());
+			this.followOutput = false;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "pagedown")) {
+			this.outputOffset += this.getOutputViewportLines();
+			this.followOutput = false;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "home")) {
+			this.outputOffset = 0;
+			this.followOutput = false;
+			this.tui.requestRender();
+		} else if (matchesKey(data, "end")) {
+			this.outputOffset = Number.MAX_SAFE_INTEGER;
+			this.followOutput = true;
+			this.tui.requestRender();
+		}
+	}
+
+	render(width: number): string[] {
+		const jobs = this.getJobs();
+		if (jobs.length === 0) {
+			this.view = "list";
+			this.selectedIndex = 0;
+		}
+		if (this.selectedIndex >= jobs.length) this.selectedIndex = Math.max(0, jobs.length - 1);
+
+		return this.view === "output" && jobs[this.selectedIndex]
+			? this.renderOutput(width, jobs[this.selectedIndex])
+			: this.renderList(width, jobs);
+	}
+
+	invalidate(): void {}
+
+	dispose(): void {
+		this.close(false);
+	}
+
+	private close(notifyDone = true): void {
+		if (this.closed) return;
+		this.closed = true;
+		clearInterval(this.refreshTimer);
+		if (notifyDone) this.done();
+	}
+
+	private getBodyLineLimit(): number {
+		const rows = Number.isFinite(this.tui.terminal.rows) ? Math.floor(this.tui.terminal.rows) : 24;
+		return Math.max(3, Math.floor(rows * 0.85) - 2);
+	}
+
+	private getOutputViewportLines(): number {
+		return Math.max(1, this.getBodyLineLimit() - 2);
+	}
+
+	private getJobSummary(job: BackgroundJob): string {
+		if (job.mode === "parallel") return `${job.results.length} tasks`;
+		const result = job.results[0];
+		if (!result) return "single task";
+		const task = result.task.replace(/\s+/g, " ").trim();
+		return `${result.agent} · ${task}`;
+	}
+
+	private renderList(width: number, jobs: BackgroundJob[]): string[] {
+		const body: string[] = [
+			this.theme.fg("text", `${jobs.length} background job${jobs.length === 1 ? "" : "s"} in this session`),
+			"",
+		];
+
+		if (jobs.length === 0) {
+			body.push(this.theme.fg("muted", "No background delegate jobs yet."));
+		} else {
+			const maxRows = Math.max(1, this.getBodyLineLimit() - 5);
+			const start = Math.max(0, Math.min(this.selectedIndex - Math.floor(maxRows / 2), jobs.length - maxRows));
+			const end = Math.min(jobs.length, start + maxRows);
+			for (let i = start; i < end; i++) {
+				const job = jobs[i]!;
+				const selected = i === this.selectedIndex;
+				const prefix = selected ? this.theme.fg("accent", "→ ") : "  ";
+				const status = this.theme.fg(
+					getJobStatusTone(job.status),
+					`${getJobStatusIcon(job.status)} ${job.status}`,
+				);
+				const id = selected ? this.theme.fg("accent", job.id) : this.theme.fg("text", job.id);
+				const summary = this.theme.fg("dim", `· ${this.getJobSummary(job)} · ${formatElapsed(job.startedAt, job.finishedAt)}`);
+				body.push(`${prefix}${id} ${status} ${summary}`);
+			}
+			if (start > 0 || end < jobs.length) {
+				body.push(this.theme.fg("dim", `  ${start + 1}-${end}/${jobs.length}`));
+			}
+		}
+
+		body.push("", this.theme.fg("dim", "↑↓ navigate · Enter view output · Esc close"));
+		return this.frame(body.slice(0, this.getBodyLineLimit()), width, "delegate:tasks");
+	}
+
+	private renderOutput(width: number, job: BackgroundJob): string[] {
+		const innerWidth = Math.max(1, width - 2);
+		const content = this.renderJobLines(getJobViewerLines(job), innerWidth);
+		const viewportLines = this.getOutputViewportLines();
+		const maxOffset = Math.max(0, content.length - viewportLines);
+		if (this.followOutput) this.outputOffset = maxOffset;
+		else this.outputOffset = Math.max(0, Math.min(this.outputOffset, maxOffset));
+
+		const visible = content.slice(this.outputOffset, this.outputOffset + viewportLines);
+		const status = this.theme.fg(getJobStatusTone(job.status), `${getJobStatusIcon(job.status)} ${job.status}`);
+		const header = `${status} ${this.theme.fg("accent", job.id)} ${this.theme.fg("dim", `${job.mode} · ${formatElapsed(job.startedAt, job.finishedAt)}`)}`;
+		const range = content.length === 0 ? "0 lines" : `${this.outputOffset + 1}-${Math.min(content.length, this.outputOffset + visible.length)}/${content.length}`;
+		const footer = this.theme.fg("dim", `←/Esc back · ↑↓/PgUp/PgDn scroll · Home/End · ${range}`);
+		const body = [header, ...visible, footer];
+		return this.frame(body.slice(0, this.getBodyLineLimit()), width, "child output");
+	}
+
+	private renderJobLines(lines: JobViewerLine[], width: number): string[] {
+		const rendered: string[] = [];
+		for (const line of lines) {
+			const wrapped = wrapTextWithAnsi(line.text, Math.max(1, width));
+			for (const part of wrapped.length > 0 ? wrapped : [""]) rendered.push(this.theme.fg(line.tone, part));
+		}
+		return rendered;
+	}
+
+	private frame(body: string[], width: number, title: string): string[] {
+		const innerWidth = Math.max(1, width - 2);
+		const border = (text: string) => this.theme.fg("accent", text);
+		const titleText = truncateToWidth(` ${title} `, innerWidth, "", true);
+		const titleWidth = visibleWidth(titleText);
+		const remaining = Math.max(0, innerWidth - titleWidth);
+		const left = Math.floor(remaining / 2);
+		const right = remaining - left;
+		const output = [
+			border(`╭${"─".repeat(left)}`) + this.theme.fg("dim", titleText) + border(`${"─".repeat(right)}╮`),
+		];
+
+		for (const line of body) {
+			const fitted = truncateToWidth(line, innerWidth, "", true);
+			const padded = fitted + " ".repeat(Math.max(0, innerWidth - visibleWidth(fitted)));
+			output.push(border("│") + padded + border("│"));
+		}
+		output.push(border(`╰${"─".repeat(innerWidth)}╯`));
+		return output;
+	}
 }
 
 // ─── Process spawning ───────────────────────────────────────────────────────
@@ -998,6 +1307,31 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: truncateForParent(text) }],
 				details: { jobs: jobs.map(toDetails) },
 			};
+		},
+	});
+
+	pi.registerCommand("delegate:tasks", {
+		description: "Browse background delegate jobs and view child output",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/delegate:tasks requires interactive TUI mode.", "warning");
+				return;
+			}
+
+			await ctx.ui.custom<void>(
+				(tui, theme, _keybindings, done) =>
+					new BackgroundJobsViewer(tui, theme, () => [...backgroundJobs.values()], done),
+				{
+					overlay: true,
+					overlayOptions: {
+						anchor: "center",
+						width: "92%",
+						minWidth: 40,
+						maxHeight: "85%",
+						margin: 1,
+					},
+				},
+			);
 		},
 	});
 }
