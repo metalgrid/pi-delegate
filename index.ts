@@ -44,6 +44,7 @@ const PARENT_OUTPUT_CAP_BYTES = 16 * 1024;
 const COLLAPSED_OUTCOME_CAP_BYTES = 2 * 1024;
 const DELEGATE_DEPTH_ENV = "PI_DELEGATE_DEPTH";
 const MAX_DELEGATION_DEPTH = 2;
+const BUNDLED_AGENT_FILES = ["architect.md", "scout.md", "worker.md"] as const;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -121,6 +122,19 @@ function makePendingResult(agent: string, task: string, resolvedModel = ""): Tas
 }
 
 // ─── Agent discovery ────────────────────────────────────────────────────────
+
+function installBundledAgents() {
+	const dir = path.join(getAgentDir(), "agents");
+	fs.mkdirSync(dir, { recursive: true });
+
+	for (const fileName of BUNDLED_AGENT_FILES) {
+		try {
+			fs.copyFileSync(new URL(`./agents/${fileName}`, import.meta.url), path.join(dir, fileName), fs.constants.COPYFILE_EXCL);
+		} catch (error) {
+			if ((error as { code?: string }).code !== "EEXIST") throw error;
+		}
+	}
+}
 
 function discoverAgents(): AgentConfig[] {
 	const dir = path.join(getAgentDir(), "agents");
@@ -898,6 +912,8 @@ const DelegateStatusParams = Type.Object({
 // ─── Extension ──────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	installBundledAgents();
+
 	const depth = getDelegateDepth();
 	if (depth >= MAX_DELEGATION_DEPTH) return;
 
