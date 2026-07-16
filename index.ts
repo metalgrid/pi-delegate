@@ -940,7 +940,7 @@ export default function (pi: ExtensionAPI) {
 			"Use scout for quick codebase lookups, worker for code changes, architect for deep analysis.",
 			"Use parallel mode when multiple tasks are independent; tasks beyond the concurrency limit are queued.",
 			"Set tasks[].model to choose a model for a specific parallel task; use top-level model as the batch default.",
-			"Set delegate background: true when work can continue before the delegated result is needed; it will signal completion automatically.",
+			"After starting delegate with background: true, do not poll with delegate_status, bash sleep, wait loops, or repeated status checks. Continue independent work or end the response; the completion message will automatically trigger a new turn.",
 		],
 		parameters: DelegateParams,
 
@@ -1070,7 +1070,7 @@ export default function (pi: ExtensionAPI) {
 				})();
 
 				return {
-					content: [{ type: "text", text: `Started background job ${job.id}. It will auto-report when complete; use delegate_status with this job ID to inspect it.` }],
+					content: [{ type: "text", text: `Started background job ${job.id}. Do not poll it; completion will be delivered automatically and trigger a new turn.` }],
 					details: toDetails(job),
 				};
 			}
@@ -1280,7 +1280,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Inspect active or completed background delegate jobs by ID. Omit jobId to list jobs started in this session.",
 		promptSnippet: "Inspect a background delegate job's status and result",
 		promptGuidelines: [
-			"Use delegate_status to inspect a background delegate job when its ID is known or its auto-reported result needs more detail.",
+			"Use delegate_status only for manual inspection when explicitly requested or when an auto-reported completion needs more detail; never use it to poll a running job.",
 		],
 		parameters: DelegateStatusParams,
 		async execute(_id, params) {
