@@ -11,8 +11,9 @@ Each subagent runs as a separate `pi` process in the parent's working directory.
 - Additional agent profiles defined as Markdown files
 - Automatic model selection with `fast`, `standard`, and `heavy` tiers
 - Per-agent, per-task, and per-invocation model overrides
+- Per-invocation and per-task working-directory overrides for git worktrees
 - Parallel execution with up to four concurrent agents
-- Background jobs that report back to the parent session automatically
+- Background jobs that report back to the parent session automatically and accept targeted steering
 - Streaming progress, token usage, cost, and child transcript rendering
 - Nested delegation limited to two levels and background-only below the parent
 
@@ -103,7 +104,7 @@ Run scout on the API and architect on the data model in parallel.
 Start a worker in the background to add tests while we inspect the bug.
 ```
 
-The extension exposes two tools.
+The extension exposes three tools.
 
 ### `delegate`
 
@@ -120,14 +121,16 @@ Parallel tasks:
 
 ```json
 {
+  "cwd": "/repo",
   "tasks": [
     {
       "agent": "scout",
       "task": "Map the request flow"
     },
     {
-      "agent": "architect",
-      "task": "Review the authorization design",
+      "agent": "worker",
+      "task": "Implement the approved API change",
+      "cwd": "/repo/.worktrees/api-change",
       "model": "provider/model-id"
     }
   ],
@@ -135,9 +138,24 @@ Parallel tasks:
 }
 ```
 
-The top-level `model` is the default for tasks without their own model. Parallel batches run at most four children concurrently; additional tasks are queued.
+Top-level `model` and `cwd` are defaults for tasks without their own values. A relative `cwd` resolves from the parent session's directory and must exist. Parallel batches run at most four children concurrently; additional tasks are queued.
 
 Background jobs automatically inject a completion message into the parent session and trigger a new turn. The parent agent should continue independent work or end its response instead of polling with `delegate_status`, `sleep`, or wait loops.
+
+### `delegate_message`
+
+Each background child receives a stable child ID when the job starts. Queued parallel children cannot be messaged until they launch. The parent can send one active child a new instruction:
+
+```json
+{
+  "jobId": "delegate-...",
+  "childId": "delegate-...:1",
+  "message": "Prioritize the failing integration test and do not alter the public API.",
+  "delivery": "steer"
+}
+```
+
+Call this through `delegate_message`. `delivery` defaults to `"steer"`, which queues the instruction after the child finishes its current tool turn; use `"followUp"` to queue it after the current run settles. Completed children cannot be messaged.
 
 ### `delegate_status`
 
@@ -161,7 +179,7 @@ Use `↑`/`↓` and Enter to select a job and view its live child output. In the
 
 ## How it works
 
-Children inherit the parent's working directory, environment, normal extension discovery, and skill discovery. They run in JSON mode without saving a session. The selected agent prompt is written to a permission-restricted temporary file and passed through `--append-system-prompt`; the file is removed when the child exits.
+Children inherit the parent's environment, normal extension discovery, and skill discovery, and run in the resolved child working directory. They run in RPC mode without saving a session so background children can receive steering messages. The selected agent prompt is written to a permission-restricted temporary file and passed through `--append-system-prompt`; the file is removed when the child exits.
 
 Child output returned to the parent is capped to keep the parent context manageable. The complete captured child transcript remains available in the tool details and expanded TUI view.
 

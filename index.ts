@@ -76,6 +76,8 @@ interface UsageStats {
 interface TaskResult {
 	agent: string;
 	task: string;
+	cwd: string;
+	childId?: string;
 	exitCode: number;
 	resolvedModel: string;
 	messages: any[];
@@ -83,6 +85,18 @@ interface TaskResult {
 	usage: UsageStats;
 	stopReason?: string;
 	errorMessage?: string;
+}
+
+interface ChildSession {
+	send(type: "steer" | "follow_up", message: string): Promise<{ success: boolean; error?: string }>;
+}
+
+interface ResolvedTask {
+	agent: string;
+	task: string;
+	model: string;
+	cwd: string;
+	childId?: string;
 }
 
 interface BackgroundJobDetails {
@@ -101,6 +115,7 @@ interface DelegateDetails {
 interface BackgroundJob extends BackgroundJobDetails {
 	mode: "single" | "parallel";
 	results: TaskResult[];
+	children: Map<string, ChildSession>;
 	controller: AbortController;
 }
 
@@ -109,10 +124,12 @@ function getDelegateDepth(): number {
 	return Number.isFinite(depth) && depth >= 0 ? depth : 0;
 }
 
-function makePendingResult(agent: string, task: string, resolvedModel = ""): TaskResult {
+function makePendingResult(agent: string, task: string, cwd: string, resolvedModel = "", childId?: string): TaskResult {
 	return {
 		agent,
 		task,
+		cwd,
+		childId,
 		exitCode: -1,
 		resolvedModel,
 		messages: [],
@@ -451,6 +468,8 @@ function getJobViewerLines(job: BackgroundJob): JobViewerLine[] {
 		const tone = running ? "warning" : failed ? "error" : "success";
 		const icon = running ? "⏳" : failed ? "✗" : "✓";
 		lines.push({ text: `${icon} ${result.agent} · ${status}`, tone });
+		if (result.childId) addJobViewerBlock(lines, `Child: ${result.childId}`, "dim");
+		addJobViewerBlock(lines, `Directory: ${result.cwd}`, "dim");
 		addJobViewerBlock(lines, `Task: ${result.task}`, "dim");
 
 		let hasOutput = false;
@@ -730,6 +749,9 @@ async function runAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: any) => void) | undefined,
 	makeDetails: (results: TaskResult[]) => DelegateDetails,
+	childId?: string,
+	onReady?: (child: ChildSession) => void,
+	onSettled?: () => void,
 ): Promise<TaskResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
@@ -737,6 +759,8 @@ async function runAgent(
 		return {
 			agent: agentName,
 			task,
+			cwd,
+			childId,
 			exitCode: 1,
 			resolvedModel: modelId,
 			messages: [],
@@ -745,18 +769,18 @@ async function runAgent(
 		};
 	}
 
-	// Keep normal extension and skill discovery enabled. The child enforces the
-	// bounded, background-only nesting policy from PI_DELEGATE_DEPTH.
-	const args = ["--mode", "json", "-p", "--no-session"];
+	// Keep normal extension and skill discovery enabled. RPC keeps stdin open so
+	// background children can receive steering messages while they are active.
+	const args = ["--mode", "rpc", "--no-session"];
 	if (modelId) args.push("--model", modelId);
 	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
 
-	// Write system prompt to temp file for --append-system-prompt
 	let tmpDir: string | null = null;
-
 	const result: TaskResult = {
 		agent: agentName,
 		task,
+		cwd,
+		childId,
 		exitCode: -1,
 		resolvedModel: modelId,
 		messages: [],
@@ -779,8 +803,6 @@ async function runAgent(
 			args.push("--append-system-prompt", tmpPath);
 		}
 
-		args.push(`Task: ${task}`);
-
 		let wasAborted = false;
 		const exitCode = await new Promise<number>((resolve) => {
 			const inv = getPiInvocation(args);
@@ -788,10 +810,43 @@ async function runAgent(
 				cwd,
 				env: { ...process.env, [DELEGATE_DEPTH_ENV]: String(getDelegateDepth() + 1) },
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 			});
 			let buf = "";
 			let closed = false;
+			let settled = false;
+			let requestId = 0;
+			const pending = new Map<string, (reply: { success: boolean; error?: string }) => void>();
+
+			const settlePending = (error: string) => {
+				for (const reply of pending.values()) reply({ success: false, error });
+				pending.clear();
+			};
+			const endInput = () => {
+				if (!proc.stdin.destroyed && proc.stdin.writable) proc.stdin.end();
+			};
+			const sendRpc = (type: "prompt" | "steer" | "follow_up", message: string, timeoutMs = 10_000) =>
+				new Promise<{ success: boolean; error?: string }>((reply) => {
+					if (closed || proc.stdin.destroyed || !proc.stdin.writable) {
+						reply({ success: false, error: "Child session is no longer active." });
+						return;
+					}
+					const id = `delegate-rpc-${++requestId}`;
+					const timeout = timeoutMs > 0 ? setTimeout(() => {
+						if (pending.delete(id)) reply({ success: false, error: "Timed out waiting for the child session." });
+					}, timeoutMs) : undefined;
+					(timeout as any)?.unref?.();
+					pending.set(id, (result) => {
+						if (timeout) clearTimeout(timeout);
+						reply(result);
+					});
+					proc.stdin.write(`${JSON.stringify({ id, type, message })}\n`, (error) => {
+						if (error && pending.delete(id)) reply({ success: false, error: error.message });
+					});
+				});
+			const child: ChildSession = {
+				send: (type, message) => sendRpc(type, message),
+			};
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -802,6 +857,17 @@ async function runAgent(
 					return;
 				}
 
+				if (ev.type === "response" && ev.id && pending.has(ev.id)) {
+					const reply = pending.get(ev.id)!;
+					pending.delete(ev.id);
+					reply({ success: ev.success === true, error: ev.error });
+					return;
+				}
+				if (ev.type === "agent_settled") {
+					settled = true;
+					onSettled?.();
+					endInput();
+				}
 				if (ev.type === "message_end" && ev.message) {
 					result.messages.push(ev.message);
 					const msg = ev.message;
@@ -830,7 +896,7 @@ async function runAgent(
 				buf += d.toString();
 				const lines = buf.split("\n");
 				buf = lines.pop() || "";
-				for (const l of lines) processLine(l);
+				for (const line of lines) processLine(line.endsWith("\r") ? line.slice(0, -1) : line);
 			});
 			proc.stderr.on("data", (d: Buffer) => {
 				result.stderr += d.toString();
@@ -838,16 +904,27 @@ async function runAgent(
 			proc.on("close", (code) => {
 				closed = true;
 				if (buf.trim()) processLine(buf);
-				resolve(code ?? 0);
+				settlePending("Child session closed.");
+				resolve(code ?? (settled ? 0 : 1));
 			});
 			proc.on("error", (err) => {
 				result.errorMessage = err.message;
+				settlePending(err.message);
 				resolve(1);
+			});
+
+			onReady?.(child);
+			void sendRpc("prompt", `Task: ${task}`, 0).then((reply) => {
+				if (!reply.success) {
+					result.errorMessage ||= reply.error || "Child session rejected the task.";
+					endInput();
+				}
 			});
 
 			if (signal) {
 				const kill = () => {
 					wasAborted = true;
+					endInput();
 					proc.kill("SIGTERM");
 					const killTimer = setTimeout(() => {
 						if (!closed) proc.kill("SIGKILL");
@@ -889,12 +966,23 @@ async function mapConcurrent<T, R>(items: T[], n: number, fn: (item: T, i: numbe
 	return results;
 }
 
+function resolveChildCwd(parentCwd: string, requested?: string): { cwd?: string; error?: string } {
+	const candidate = requested?.trim() ? path.resolve(parentCwd, requested.trim()) : parentCwd;
+	try {
+		if (!fs.statSync(candidate).isDirectory()) return { error: `Working directory is not a directory: ${candidate}` };
+		return { cwd: candidate };
+	} catch {
+		return { error: `Working directory does not exist: ${candidate}` };
+	}
+}
+
 // ─── Tool parameter schema ──────────────────────────────────────────────────
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Agent name" }),
 	task: Type.String({ description: "Task description" }),
 	model: Type.Optional(Type.String({ description: "Model override for this task (e.g. 'provider/model-id')." })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for this child; overrides the invocation cwd." })),
 });
 
 const DelegateParams = Type.Object({
@@ -902,7 +990,15 @@ const DelegateParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task for single mode" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Tasks for parallel mode; runs up to 4 concurrently and queues the rest" })),
 	model: Type.Optional(Type.String({ description: "Default model override for this invocation (e.g. 'provider/model-id')." })),
+	cwd: Type.Optional(Type.String({ description: "Default child working directory; relative paths resolve from the parent cwd." })),
 	background: Type.Optional(Type.Boolean({ description: "Start work in the background and return a job ID immediately." })),
+});
+
+const DelegateMessageParams = Type.Object({
+	jobId: Type.String({ description: "Background job ID." }),
+	childId: Type.String({ description: "Target child ID reported when the background job starts." }),
+	message: Type.String({ description: "Instruction to send to the child." }),
+	delivery: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], { description: "Deliver after the current turn or after the child settles; defaults to steer." })),
 });
 
 const DelegateStatusParams = Type.Object({
@@ -1005,27 +1101,49 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const tasks = params.tasks ?? [];
-			const initialResults = hasSingle
-				? [makePendingResult(params.agent!, params.task!, modelFor(params.agent!))]
-				: tasks.map((task) => makePendingResult(task.agent, task.task, modelFor(task.agent, task.model)));
+			const rawTasks = hasSingle
+				? [{ agent: params.agent!, task: params.task!, model: undefined, cwd: undefined }]
+				: params.tasks!;
+			const tasks: ResolvedTask[] = [];
+			for (const task of rawTasks) {
+				const requestedCwd = task.cwd?.trim() ? task.cwd : params.cwd;
+				const resolved = resolveChildCwd(ctx.cwd, requestedCwd);
+				if (!resolved.cwd) {
+					return {
+						content: [{ type: "text", text: resolved.error! }],
+						details: mkDetails([]),
+						isError: true,
+					};
+				}
+				tasks.push({
+					agent: task.agent,
+					task: task.task,
+					model: modelFor(task.agent, task.model),
+					cwd: resolved.cwd,
+				});
+			}
+
+			const makeInitialResults = (withChildIds: boolean, jobId?: string) =>
+				tasks.map((task, index) =>
+					makePendingResult(task.agent, task.task, task.cwd, task.model, withChildIds ? `${jobId}:${index + 1}` : undefined),
+				);
 
 			const runTask = async (
-				agent: string,
-				task: string,
-				model: string,
+				task: ResolvedTask,
 				runSignal: AbortSignal | undefined,
 				onTaskUpdate: (result: TaskResult) => void,
+				onReady?: (child: ChildSession) => void,
+				onSettled?: () => void,
 			): Promise<TaskResult> => {
 				try {
-					const result = await runAgent(ctx.cwd, agents, agent, task, model, runSignal, (partial: any) => {
+					const result = await runAgent(task.cwd, agents, task.agent, task.task, task.model, runSignal, (partial: any) => {
 						const update = partial.details?.results[0] as TaskResult | undefined;
 						if (update) onTaskUpdate(update);
-					}, (results) => mkDetails(results));
+					}, (results) => mkDetails(results), task.childId, onReady, onSettled);
 					onTaskUpdate(result);
 					return result;
 				} catch (error) {
-					const failed = makePendingResult(agent, task, model);
+					const failed = makePendingResult(task.agent, task.task, task.cwd, task.model, task.childId);
 					failed.exitCode = 1;
 					failed.errorMessage = error instanceof Error ? error.message : String(error);
 					onTaskUpdate(failed);
@@ -1037,36 +1155,64 @@ export default function (pi: ExtensionAPI) {
 				results: TaskResult[],
 				runSignal: AbortSignal | undefined,
 				onProgress?: () => void,
+				onChildReady?: (task: ResolvedTask, child: ChildSession) => void,
+				onChildSettled?: (task: ResolvedTask) => void,
 			): Promise<TaskResult[]> =>
 				mapConcurrent(tasks, MAX_CONCURRENCY, async (task, index) => {
-					const result = await runTask(task.agent, task.task, modelFor(task.agent, task.model), runSignal, (update) => {
+					task.childId = results[index].childId;
+					const result = await runTask(task, runSignal, (update) => {
 						results[index] = update;
 						onProgress?.();
-					});
+					}, (child) => onChildReady?.(task, child), () => onChildSettled?.(task));
 					return result;
 				});
 
 			if (params.background) {
 				const id = `delegate-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+				const initialResults = makeInitialResults(true, id);
+				for (const [index, task] of tasks.entries()) task.childId = initialResults[index].childId;
 				const job: BackgroundJob = {
 					id,
 					mode,
 					status: "running",
 					startedAt: Date.now(),
 					results: initialResults,
+					children: new Map(),
 					controller: new AbortController(),
 				};
 				backgroundJobs.set(id, job);
 
+				const updateResult = (index: number, update: TaskResult) => {
+					job.results[index] = update;
+					if (update.exitCode !== -1 && update.childId) job.children.delete(update.childId);
+				};
+				const registerChild = (task: ResolvedTask, child: ChildSession) => {
+					if (task.childId) job.children.set(task.childId, child);
+				};
 				void (async () => {
 					if (hasSingle) {
-						job.results[0] = await runTask(params.agent!, params.task!, modelFor(params.agent!), job.controller.signal, (update) => {
-							job.results[0] = update;
-						});
+						job.results[0] = await runTask(
+							tasks[0],
+							job.controller.signal,
+							(update) => updateResult(0, update),
+							(child) => registerChild(tasks[0], child),
+							() => {
+								if (tasks[0].childId) job.children.delete(tasks[0].childId);
+							},
+						);
 					} else {
-						job.results = await runParallel(job.results, job.controller.signal);
+						job.results = await runParallel(
+							job.results,
+							job.controller.signal,
+							undefined,
+							registerChild,
+							(task) => {
+								if (task.childId) job.children.delete(task.childId);
+							},
+						);
 					}
 					job.status = job.controller.signal.aborted ? "aborted" : job.results.every((result) => !isFailedResult(result)) ? "completed" : "failed";
+					job.children.clear();
 					job.finishedAt = Date.now();
 
 					if (!acceptingBackgroundCompletions) return;
@@ -1085,15 +1231,17 @@ export default function (pi: ExtensionAPI) {
 					}
 				})();
 
+				const targets = initialResults.map((result) => `${result.childId} (${result.agent})`).join(", ");
 				return {
-					content: [{ type: "text", text: `Started background job ${job.id}. Do not poll it; completion will be delivered automatically and trigger a new turn.` }],
+					content: [{ type: "text", text: `Started background job ${job.id}. Target child IDs: ${targets}. Use delegate_message to steer an active child; do not poll the job. Completion will be delivered automatically and trigger a new turn.` }],
 					details: toDetails(job),
 				};
 			}
 
+			const initialResults = makeInitialResults(false);
 			if (hasSingle) {
-				const result = await runTask(params.agent!, params.task!, modelFor(params.agent!), signal, (update) => onUpdate?.({
-					content: [{ type: "text", text: `Agent ${params.agent} running…` }],
+				const result = await runTask(tasks[0], signal, (update) => onUpdate?.({
+					content: [{ type: "text", text: `Agent ${tasks[0].agent} running…` }],
 					details: mkDetails([update]),
 				}));
 				return {
@@ -1287,6 +1435,45 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!expanded) t += `\n${theme.fg("muted", "(Ctrl+O to show child transcripts)")}`;
 			return new Text(t, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "delegate_message",
+		label: "Delegate Message",
+		description: "Send a steering or follow-up instruction to one active child in a background delegate job.",
+		promptSnippet: "Send an instruction to an active background delegate child",
+		promptGuidelines: [
+			"Use delegate_message only to steer an active background child when new information materially affects its task.",
+			"Target exactly one child using the job ID and child ID returned by delegate.",
+		],
+		parameters: DelegateMessageParams,
+		async execute(_id, params) {
+			const job = backgroundJobs.get(params.jobId);
+			if (!job) {
+				return { content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }], details: {}, isError: true };
+			}
+			const child = job.children.get(params.childId);
+			if (!child) {
+				return {
+					content: [{ type: "text", text: `Child ${params.childId} is not active in background job ${params.jobId}.` }],
+					details: { jobId: job.id, childId: params.childId, status: job.status },
+					isError: true,
+				};
+			}
+			const delivery = params.delivery === "followUp" ? "follow_up" : "steer";
+			const reply = await child.send(delivery, params.message);
+			if (!reply.success) {
+				return {
+					content: [{ type: "text", text: `Could not message ${params.childId}: ${reply.error || "child rejected the instruction."}` }],
+					details: { jobId: job.id, childId: params.childId, delivery },
+					isError: true,
+				};
+			}
+			return {
+				content: [{ type: "text", text: `Sent ${params.delivery === "followUp" ? "follow-up" : "steering"} instruction to ${params.childId}.` }],
+				details: { jobId: job.id, childId: params.childId, delivery },
+			};
 		},
 	});
 
