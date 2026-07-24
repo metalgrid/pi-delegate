@@ -6,7 +6,9 @@ Each subagent runs as a separate `pi` process in the parent's working directory.
 
 ## Features
 
-- Agent profiles defined as Markdown files
+- Three bundled agent profiles (`scout`, `architect`, and `worker`)
+- A `team-lead` skill for plan-driven, review-gated multi-agent delivery
+- Additional agent profiles defined as Markdown files
 - Automatic model selection with `fast`, `standard`, and `heavy` tiers
 - Per-agent, per-task, and per-invocation model overrides
 - Parallel execution with up to four concurrent agents
@@ -36,9 +38,23 @@ pi remove git:github.com/metalgrid/pi-delegate
 > [!WARNING]
 > Pi extensions and delegated agents run with your user permissions. Review this extension and limit each agent's tools to operations you trust.
 
+On first load, the extension copies its bundled `scout`, `architect`, and `worker` profiles into `~/.pi/agent/agents/`. Existing files are never overwritten, so local customizations remain intact.
+
+## Team-lead workflow
+
+The package includes a `team-lead` skill that coordinates complex work through planning, task-isolation analysis, lead-managed git worktrees, background implementation delegates, review/fix loops, a senior final review, and sensible history squashing.
+
+Invoke it explicitly with:
+
+```text
+/skill:team-lead Implement the requested feature
+```
+
+The skill requires implementation and corrective workers to run as background delegates. While they run, the lead stays in stand-by and resumes review when the extension reports completion. Worktree creation, integration, cleanup, and history rewriting remain the lead's responsibility; the skill requires explicit safety checks before destructive or shared-history operations.
+
 ## Configure agents
 
-Create agent profiles in `~/.pi/agent/agents/`. Each profile is a Markdown file with YAML-like frontmatter followed by the agent's system prompt:
+The bundled profiles work out of the box. Add or customize profiles in `~/.pi/agent/agents/`; each profile is a Markdown file with YAML-like frontmatter followed by the agent's system prompt:
 
 ```markdown
 ---
@@ -153,7 +169,7 @@ Child output returned to the parent is capped to keep the parent context managea
 
 - A working `pi` installation
 - At least one configured and authenticated model
-- One or more agent profiles in `~/.pi/agent/agents/`
+- Write access to `~/.pi/agent/agents/` on first load so missing bundled profiles can be installed
 
 ## Development
 
