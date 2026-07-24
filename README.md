@@ -121,6 +121,8 @@ Parallel tasks:
 
 The top-level `model` is the default for tasks without their own model. Parallel batches run at most four children concurrently; additional tasks are queued.
 
+Background jobs automatically inject a completion message into the parent session and trigger a new turn. The parent agent should continue independent work or end its response instead of polling with `delegate_status`, `sleep`, or wait loops.
+
 ### `delegate_status`
 
 Inspect one background job:
