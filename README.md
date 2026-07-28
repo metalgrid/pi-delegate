@@ -104,7 +104,7 @@ Run scout on the API and architect on the data model in parallel.
 Start a worker in the background to add tests while we inspect the bug.
 ```
 
-The extension exposes three tools.
+The extension exposes four tools.
 
 ### `delegate`
 
@@ -156,6 +156,19 @@ Each background child receives a stable child ID when the job starts. Queued par
 ```
 
 Call this through `delegate_message`. `delivery` defaults to `"steer"`, which queues the instruction after the child finishes its current tool turn; use `"followUp"` to queue it after the current run settles. Completed children cannot be messaged.
+
+### `delegate_terminate`
+
+Stop one active background child:
+
+```json
+{
+  "jobId": "delegate-...",
+  "childId": "delegate-...:1"
+}
+```
+
+Queued and completed children cannot be terminated individually. Termination marks the child result as aborted; the remaining children in a parallel job continue running.
 
 ### `delegate_status`
 

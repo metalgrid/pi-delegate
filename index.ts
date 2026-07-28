@@ -89,6 +89,7 @@ interface TaskResult {
 
 interface ChildSession {
 	send(type: "steer" | "follow_up", message: string): Promise<{ success: boolean; error?: string }>;
+	terminate(): boolean;
 }
 
 interface ResolvedTask {
@@ -844,8 +845,20 @@ async function runAgent(
 						if (error && pending.delete(id)) reply({ success: false, error: error.message });
 					});
 				});
+			const terminate = () => {
+				if (closed) return false;
+				wasAborted = true;
+				endInput();
+				if (!proc.kill("SIGTERM")) return false;
+				const killTimer = setTimeout(() => {
+					if (!closed) proc.kill("SIGKILL");
+				}, 5000);
+				(killTimer as any).unref?.();
+				return true;
+			};
 			const child: ChildSession = {
 				send: (type, message) => sendRpc(type, message),
+				terminate,
 			};
 
 			const processLine = (line: string) => {
@@ -922,17 +935,8 @@ async function runAgent(
 			});
 
 			if (signal) {
-				const kill = () => {
-					wasAborted = true;
-					endInput();
-					proc.kill("SIGTERM");
-					const killTimer = setTimeout(() => {
-						if (!closed) proc.kill("SIGKILL");
-					}, 5000);
-					(killTimer as any).unref?.();
-				};
-				if (signal.aborted) kill();
-				else signal.addEventListener("abort", kill, { once: true });
+				if (signal.aborted) terminate();
+				else signal.addEventListener("abort", terminate, { once: true });
 			}
 		});
 
@@ -999,6 +1003,11 @@ const DelegateMessageParams = Type.Object({
 	childId: Type.String({ description: "Target child ID reported when the background job starts." }),
 	message: Type.String({ description: "Instruction to send to the child." }),
 	delivery: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")], { description: "Deliver after the current turn or after the child settles; defaults to steer." })),
+});
+
+const DelegateTerminateParams = Type.Object({
+	jobId: Type.String({ description: "Background job ID." }),
+	childId: Type.String({ description: "Active child ID reported when the background job starts." }),
 });
 
 const DelegateStatusParams = Type.Object({
@@ -1473,6 +1482,44 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: `Sent ${params.delivery === "followUp" ? "follow-up" : "steering"} instruction to ${params.childId}.` }],
 				details: { jobId: job.id, childId: params.childId, delivery },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "delegate_terminate",
+		label: "Delegate Terminate",
+		description: "Terminate one active child in a background delegate job.",
+		promptSnippet: "Terminate an active background delegate child",
+		promptGuidelines: [
+			"Use delegate_terminate only when explicitly asked to stop an active background child or when continuing it would be harmful or wasteful.",
+			"Target exactly one active child using the job ID and child ID returned by delegate.",
+		],
+		parameters: DelegateTerminateParams,
+		async execute(_id, params) {
+			const job = backgroundJobs.get(params.jobId);
+			if (!job) {
+				return { content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }], details: {}, isError: true };
+			}
+			const child = job.children.get(params.childId);
+			if (!child) {
+				return {
+					content: [{ type: "text", text: `Child ${params.childId} is not active in background job ${params.jobId}.` }],
+					details: { jobId: job.id, childId: params.childId, status: job.status },
+					isError: true,
+				};
+			}
+			if (!child.terminate()) {
+				return {
+					content: [{ type: "text", text: `Could not terminate ${params.childId}; the child is no longer active.` }],
+					details: { jobId: job.id, childId: params.childId },
+					isError: true,
+				};
+			}
+			job.children.delete(params.childId);
+			return {
+				content: [{ type: "text", text: `Terminating ${params.childId}.` }],
+				details: { jobId: job.id, childId: params.childId },
 			};
 		},
 	});
