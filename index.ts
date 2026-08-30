@@ -22,7 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, getMarkdownTheme, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
@@ -124,6 +124,17 @@ interface BackgroundJob extends BackgroundJobDetails {
 	children: Map<string, ChildSession>;
 	controller: AbortController;
 }
+
+interface ChildActionDetails {
+	jobId: string;
+	childId: string;
+	status?: BackgroundJobDetails["status"];
+	delivery?: "steer" | "follow_up";
+}
+
+// pi's AgentToolResult does not declare isError yet; the runtime only marks errors
+// when execute throws. Tools still return isError to keep failure intent explicit.
+type ToolResult<T> = AgentToolResult<T> & { isError?: boolean };
 
 function getDelegateDepth(): number {
 	const depth = Number.parseInt(process.env[DELEGATE_DEPTH_ENV] ?? "0", 10);
@@ -604,11 +615,11 @@ class BackgroundJobsViewer {
 			this.outputOffset++;
 			this.followOutput = false;
 			this.tui.requestRender();
-		} else if (matchesKey(data, "pageup")) {
+		} else if (matchesKey(data, "pageUp")) {
 			this.outputOffset = Math.max(0, this.outputOffset - this.getOutputViewportLines());
 			this.followOutput = false;
 			this.tui.requestRender();
-		} else if (matchesKey(data, "pagedown")) {
+		} else if (matchesKey(data, "pageDown")) {
 			this.outputOffset += this.getOutputViewportLines();
 			this.followOutput = false;
 			this.tui.requestRender();
@@ -1502,10 +1513,14 @@ export default function (pi: ExtensionAPI) {
 			"Target exactly one child using the job ID and child ID returned by delegate.",
 		],
 		parameters: DelegateMessageParams,
-		async execute(_id, params) {
+		async execute(_id, params): Promise<ToolResult<ChildActionDetails>> {
 			const job = backgroundJobs.get(params.jobId);
 			if (!job) {
-				return { content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }], details: {}, isError: true };
+				return {
+					content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }],
+					details: { jobId: params.jobId, childId: params.childId },
+					isError: true,
+				};
 			}
 			const child = job.children.get(params.childId);
 			if (!child) {
@@ -1541,10 +1556,14 @@ export default function (pi: ExtensionAPI) {
 			"Target exactly one active child using the job ID and child ID returned by delegate.",
 		],
 		parameters: DelegateTerminateParams,
-		async execute(_id, params) {
+		async execute(_id, params): Promise<ToolResult<ChildActionDetails>> {
 			const job = backgroundJobs.get(params.jobId);
 			if (!job) {
-				return { content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }], details: {}, isError: true };
+				return {
+					content: [{ type: "text", text: `Unknown background job: ${params.jobId}` }],
+					details: { jobId: params.jobId, childId: params.childId },
+					isError: true,
+				};
 			}
 			const child = job.children.get(params.childId);
 			if (!child) {
