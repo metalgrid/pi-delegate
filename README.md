@@ -14,6 +14,7 @@ Each subagent runs as a separate `pi` process in the parent's working directory.
 - Per-agent, per-task, and per-invocation thinking-level overrides
 - Per-invocation and per-task working-directory overrides for git worktrees
 - Parallel execution with up to four concurrent agents
+- A `consensus` tool: N independent solvers, arbiter merge, optional debate rounds
 - Background jobs that report back to the parent session automatically and accept targeted steering
 - Streaming progress, token usage, cost, and child transcript rendering
 - Nested delegation limited to two levels and background-only below the parent
@@ -117,7 +118,7 @@ Run scout on the API and architect on the data model in parallel.
 Start a worker in the background to add tests while we inspect the bug.
 ```
 
-The extension exposes four tools.
+The extension exposes five tools.
 
 ### `delegate`
 
@@ -205,6 +206,24 @@ Interactive job viewer:
 ```
 
 Use `↑`/`↓` and Enter to select a job and view its live child output. In the output view, use `↑`/`↓`, Page Up/Down, Home/End to scroll; Escape or Left returns to the list, and Escape from the list closes the modal. The viewer is read-only: it never sends input to or cancels a child session.
+
+### `consensus`
+
+Have several solvers work the same task independently, then merge their answers into one stable result:
+
+```json
+{
+  "agent": "architect",
+  "task": "Design the migration plan from config v1 to v2",
+  "n": 3,
+  "rounds": 2,
+  "models": ["provider/a", "provider/b"]
+}
+```
+
+Round 0 spawns `n` independent solvers (2–5, default 3). An arbiter child then merges all proposals into one result and reports material disagreement as dissent notes. With `rounds > 1` (max 3), a divided verdict triggers a broadcast debate round: every solver receives the anonymized competing proposals plus the arbiter's notes and produces a revised proposal; the arbiter merges again. The loop stops as soon as the arbiter reports consensus or the rounds budget is spent.
+
+The parent receives only the merged result and the dissent notes; per-child transcripts stay in the tool details. Each round costs `n + 1` model calls, so keep `n` small unless the stakes justify more. `models` cycles per solver — diverse models make consensus more meaningful. `thinking` applies to solvers and the arbiter. `cwd` sets the working directory for all children. Consensus runs in the foreground only and cannot run inside a delegated child session.
 
 ## How it works
 

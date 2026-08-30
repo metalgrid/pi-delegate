@@ -8,6 +8,7 @@
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent, task, model?, thinking? }, ...] } (up to 4 concurrent)
  *   - Background: add { background: true } to return a job ID immediately
+ *   - Consensus: { agent, task, n, rounds } — N solvers + arbiter merge, debate rounds while divided
  *
  * Extensions & Skills:
  *   - Child processes keep normal extension and skill auto-discovery enabled
@@ -44,6 +45,7 @@ const PARENT_OUTPUT_CAP_BYTES = 16 * 1024;
 const COLLAPSED_OUTCOME_CAP_BYTES = 2 * 1024;
 const DELEGATE_DEPTH_ENV = "PI_DELEGATE_DEPTH";
 const MAX_DELEGATION_DEPTH = 2;
+const CONSENSUS_PROPOSAL_CAP_BYTES = 8 * 1024;
 const BUNDLED_AGENT_FILES = ["architect.md", "scout.md", "worker.md"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -116,6 +118,21 @@ interface DelegateDetails {
 	mode: "single" | "parallel";
 	results: TaskResult[];
 	background?: BackgroundJobDetails;
+}
+
+interface ConsensusDetails {
+	agent: string;
+	task: string;
+	n: number;
+	rounds: number;
+	roundsUsed: number;
+	consensusReached: boolean;
+	mergedPlan: string;
+	dissent: string;
+	children: TaskResult[];
+	usage: UsageStats;
+	resolvedModel: string;
+	failed: boolean;
 }
 
 interface BackgroundJob extends BackgroundJobDetails {
@@ -318,6 +335,12 @@ function resolveModelForTier(
 	}
 
 	return `${picked.provider}/${picked.id}`;
+}
+
+function tierModelMap(available: any[], fallback?: string): Map<Tier, string> {
+	const map = new Map<Tier, string>();
+	for (const tier of ["fast", "standard", "heavy"] as Tier[]) map.set(tier, resolveModelForTier(available, tier, fallback));
+	return map;
 }
 
 // ─── Formatting helpers ─────────────────────────────────────────────────────
@@ -782,7 +805,7 @@ async function runAgent(
 	thinking: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: any) => void) | undefined,
-	makeDetails: (results: TaskResult[]) => DelegateDetails,
+	makeDetails: (results: TaskResult[]) => unknown,
 	childId?: string,
 	onReady?: (child: ChildSession) => void,
 	onSettled?: () => void,
@@ -1016,6 +1039,176 @@ function resolveChildCwd(parentCwd: string, requested?: string): { cwd?: string;
 	}
 }
 
+// ─── Consensus ──────────────────────────────────────────────────────────────
+
+function solverTaskPrompt(task: string): string {
+	return [
+		"Work independently on the task below. Produce a complete, self-contained result.",
+		"If the task asks for a plan, produce an ordered plan with concrete steps and verification.",
+		"",
+		"TASK:",
+		task,
+	].join("\n");
+}
+
+function revisionTaskPrompt(task: string, previous: string, competing: string[], notes: string): string {
+	const labels = competing.map((text, i) => `[${String.fromCharCode(65 + i)}]\n${text}`).join("\n\n");
+	return [
+		"Work on the task below again. Since your last attempt, other reviewers produced competing proposals and an arbiter identified unresolved disagreements.",
+		"",
+		"TASK:",
+		task,
+		"",
+		"YOUR PREVIOUS PROPOSAL:",
+		previous,
+		"",
+		"COMPETING PROPOSALS:",
+		labels,
+		"",
+		"ARBITER NOTES:",
+		notes,
+		"",
+		"Revise your proposal: keep what survives scrutiny, fix what the notes and competing proposals expose as weaker. Output the full revised proposal.",
+	].join("\n");
+}
+
+function judgeTaskPrompt(task: string, proposals: string[]): string {
+	const labels = proposals
+		.map((text, i) => `[${String.fromCharCode(65 + i)}]\n${truncateForParent(text, CONSENSUS_PROPOSAL_CAP_BYTES)}`)
+		.join("\n\n");
+	return [
+		"You are the arbiter between independent proposals for the same task.",
+		"",
+		"TASK:",
+		task,
+		"",
+		"PROPOSALS:",
+		labels,
+		"",
+		"Merge them into ONE stable result: adopt the strongest version of every point, resolve disagreements using the better argument, and drop whatever no proposal justifies.",
+		"The merged result must be complete and self-contained - a reader must not need the original proposals.",
+		"",
+		"Output format, exactly:",
+		"1. The merged result.",
+		"2. A line 'DISSENT NOTES:' followed by bullets for material disagreements you could not resolve (write 'DISSENT NOTES:' then 'None.' if fully resolved).",
+		"3. A final line 'CONSENSUS: REACHED' if the proposals materially agreed, or 'CONSENSUS: DIVIDED' if another debate round is needed.",
+	].join("\n");
+}
+
+function parseJudgeOutput(output: string): { mergedPlan: string; dissent: string; reached: boolean } {
+	const consensusMatch = [...output.matchAll(/CONSENSUS:\s*(REACHED|DIVIDED)/gi)].at(-1);
+	const reached = consensusMatch ? consensusMatch[1]!.toUpperCase() === "REACHED" : true;
+	const dissentIdx = output.search(/DISSENT NOTES?:/i);
+	const mergedPlan = (dissentIdx === -1 ? output : output.slice(0, dissentIdx)).trim();
+	const dissent = dissentIdx === -1
+		? ""
+		: output.slice(dissentIdx).replace(/^DISSENT NOTES?:/i, "").replace(/CONSENSUS:.*$/im, "").trim();
+	return { mergedPlan, dissent, reached };
+}
+
+function sumUsage(results: TaskResult[]): UsageStats {
+	const u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+	for (const r of results) {
+		u.input += r.usage.input;
+		u.output += r.usage.output;
+		u.cacheRead += r.usage.cacheRead;
+		u.cacheWrite += r.usage.cacheWrite;
+		u.cost += r.usage.cost;
+		u.turns += r.usage.turns;
+	}
+	return u;
+}
+
+async function orchestrateConsensus(opts: {
+	agents: AgentConfig[];
+	agent: string;
+	task: string;
+	cwd: string;
+	n: number;
+	maxRounds: number;
+	solverModels: string[];
+	thinking?: string;
+	signal: AbortSignal | undefined;
+	onPhase?: (text: string, details: ConsensusDetails) => void;
+}): Promise<ConsensusDetails> {
+	const { agents, agent, task, cwd, n, maxRounds, solverModels, thinking, signal } = opts;
+	const children: TaskResult[] = [];
+	let generation = 0;
+	let roundsUsed = 0;
+	let consensusReached = false;
+	let mergedPlan = "";
+	let dissent = "";
+	let failed = false;
+
+	const snapshot = (): ConsensusDetails => ({
+		agent,
+		task,
+		n,
+		rounds: maxRounds,
+		roundsUsed,
+		consensusReached,
+		mergedPlan,
+		dissent,
+		children: children.map((c) => ({ ...c, messages: [...c.messages], usage: { ...c.usage } })),
+		usage: sumUsage(children),
+		resolvedModel: solverModels[0] ?? "",
+		failed,
+	});
+
+	const proposalText = (r: TaskResult) => getFinalOutput(r.messages).trim();
+	const viable = (rs: TaskResult[]) => rs.filter((r) => !isFailedResult(r) && proposalText(r));
+
+	const spawnJudge = async () => {
+		const judge = await runAgent(cwd, agents, agent, judgeTaskPrompt(task, texts), solverModels[0] ?? "", thinking, signal, undefined, () => undefined);
+		children.push(judge);
+		return judge;
+	};
+
+	let texts: string[] = [];
+	const runSolvers = async (prompts: string[]) => {
+		generation++;
+		const results = await mapConcurrent(prompts, MAX_CONCURRENCY, (prompt, i) =>
+			runAgent(cwd, agents, agent, prompt, solverModels[i] ?? solverModels[0] ?? "", thinking, signal, undefined, () => undefined),
+		);
+		children.push(...results);
+		const ok = viable(results).map(proposalText);
+		if (ok.length === 0) {
+			const detail = results
+				.map((r, i) => `#${i + 1} exit=${r.exitCode} stop=${r.stopReason ?? "-"} err=${(r.errorMessage || r.stderr).slice(0, 160) || "-"}`)
+				.join("; ");
+			throw new Error(`all solvers failed in round ${generation}: ${detail}`);
+		}
+		texts = ok;
+	};
+
+	opts.onPhase?.(`Consensus round 1: ${n} solvers running…`, snapshot());
+	await runSolvers(Array.from({ length: n }, () => solverTaskPrompt(task)));
+
+	while (true) {
+		opts.onPhase?.(`Arbiter: merging ${texts.length} proposals…`, snapshot());
+		const judge = await spawnJudge();
+		roundsUsed = generation;
+		if (isFailedResult(judge)) {
+			failed = true;
+			mergedPlan = mergedPlan || texts[0]!;
+			dissent = dissent || "Arbiter failed to complete; the merged result is unverified.";
+			break;
+		}
+		const parsed = parseJudgeOutput(proposalText(judge));
+		mergedPlan = parsed.mergedPlan || proposalText(judge);
+		dissent = parsed.dissent;
+		consensusReached = parsed.reached;
+		if (consensusReached || generation >= maxRounds) break;
+
+		opts.onPhase?.(`Divided after round ${generation}; broadcasting competing proposals to solvers…`, snapshot());
+		const notes = dissent || "The arbiter flagged material disagreements; study the competing proposals and resolve them.";
+		const revisePrompts = texts.map((mine, i) => revisionTaskPrompt(task, mine, texts.filter((_, j) => j !== i), notes));
+		await runSolvers(revisePrompts);
+	}
+
+	return snapshot();
+}
+
 // ─── Tool parameter schema ──────────────────────────────────────────────────
 
 const ThinkingLevelParam = Type.Union(
@@ -1039,6 +1232,16 @@ const DelegateParams = Type.Object({
 	thinking: Type.Optional(ThinkingLevelParam),
 	cwd: Type.Optional(Type.String({ description: "Default child working directory; relative paths resolve from the parent cwd." })),
 	background: Type.Optional(Type.Boolean({ description: "Start work in the background and return a job ID immediately." })),
+});
+
+const ConsensusParams = Type.Object({
+	agent: Type.String({ description: "Solver agent name (all solvers and the arbiter share this profile)" }),
+	task: Type.String({ description: "The problem or planning request every solver works on" }),
+	n: Type.Optional(Type.Integer({ minimum: 2, maximum: 5, description: "Number of independent solvers: 2-5, default 3" })),
+	rounds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3, description: "Max solver generations: 1-3, default 1. Divided verdicts trigger broadcast debate rounds only while this budget lasts" })),
+	models: Type.Optional(Type.Array(Type.String(), { description: "Per-solver model overrides ('provider/model-id'); cycled if shorter than n. Diverse models yield stronger consensus" })),
+	thinking: Type.Optional(ThinkingLevelParam),
+	cwd: Type.Optional(Type.String({ description: "Working directory for all children" })),
 });
 
 const DelegateMessageParams = Type.Object({
@@ -1116,10 +1319,7 @@ export default function (pi: ExtensionAPI) {
 			const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
 			const extList = discoverExtensions(ctx.cwd);
 			const skillList = discoverSkills(ctx.cwd);
-			const tierModel = new Map<Tier, string>();
-			for (const tier of ["fast", "standard", "heavy"] as Tier[]) {
-				tierModel.set(tier, resolveModelForTier(available, tier, fallback));
-			}
+			const tierModel = tierModelMap(available, fallback);
 
 			const defaultModel = params.model?.trim() || "";
 			function modelFor(agentName: string, taskModel?: string): string {
@@ -1500,6 +1700,116 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!expanded) t += `\n${theme.fg("muted", "(Ctrl+O to show child transcripts)")}`;
 			return new Text(t, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "consensus",
+		label: "Consensus",
+		description: [
+			"Have N solvers work the same task independently, then merge their answers into one stable result via an arbiter.",
+			"Round 0 spawns n independent solvers (diversify with models[]); an arbiter child merges all proposals and reports material disagreement as dissent notes.",
+			"With rounds > 1, a divided verdict triggers broadcast debate: each solver sees the anonymized competing proposals plus arbiter notes and revises.",
+			"Returns only the merged result and dissent notes; full child transcripts stay in the tool details.",
+			"Foreground only; nested (child) sessions cannot run consensus.",
+		].join(" "),
+		promptSnippet: "Reach multi-agent consensus on a plan or answer",
+		promptGuidelines: [
+			"Use consensus for high-stakes plans where a single agent's answer is not trustworthy enough.",
+			"Diversify solvers with models[] (and thinking) so the arbiter has material to reconcile.",
+			"Costs n+1 model calls per round; keep n at 2-3 and rounds at 1-2 unless the stakes justify more.",
+		],
+		parameters: ConsensusParams,
+
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const agents = discoverAgents();
+			const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+			const known = agents.find((a) => a.name === params.agent);
+			if (!known) {
+				const names = agents.map((a) => a.name).join(", ") || "none";
+				return { content: [{ type: "text", text: `Unknown agent "${params.agent}". Available: ${names}` }], details: undefined, isError: true };
+			}
+			if (getDelegateDepth() > 0) {
+				return { content: [{ type: "text", text: "consensus cannot run inside a delegated child session." }], details: undefined, isError: true };
+			}
+			const resolved = resolveChildCwd(ctx.cwd, params.cwd);
+			if (!resolved.cwd) {
+				return { content: [{ type: "text", text: resolved.error! }], details: undefined, isError: true };
+			}
+			const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+			const n = clamp(Math.round(params.n ?? 3), 2, 5);
+			const maxRounds = clamp(Math.round(params.rounds ?? 1), 1, 3);
+			const defaultModel = known.model || tierModelMap(ctx.modelRegistry.getAvailable(), fallback).get(known.tier) || fallback;
+			const solverModels = Array.from({ length: n }, (_, i) => params.models?.[i]?.trim() || defaultModel);
+			const thinking = params.thinking ?? known.thinking;
+
+			try {
+				const details = await orchestrateConsensus({
+					agents,
+					agent: params.agent,
+					task: params.task,
+					cwd: resolved.cwd,
+					n,
+					maxRounds,
+					solverModels,
+					thinking,
+					signal,
+					onPhase: onUpdate ? (text, snap) => onUpdate({ content: [{ type: "text", text }], details: snap }) : undefined,
+				});
+				const meta = `Consensus (${params.agent} × ${n}, ${details.roundsUsed} round${details.roundsUsed === 1 ? "" : "s"}): ${details.consensusReached ? "reached" : "DIVIDED"}`;
+				const body = [meta, "", details.mergedPlan || "(no merged output)", details.dissent ? `\nDissent notes:\n${details.dissent}` : ""]
+					.filter(Boolean)
+					.join("\n");
+				return { content: [{ type: "text", text: truncateForParent(body) }], details, isError: details.failed || undefined };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return { content: [{ type: "text", text: `Consensus failed: ${message}` }], details: undefined, isError: true };
+			}
+		},
+
+		renderCall(args, theme) {
+			const p = args.task ? (args.task.length > 60 ? args.task.slice(0, 60) + "…" : args.task) : "…";
+			const t = theme.fg("toolTitle", theme.bold("consensus "))
+				+ theme.fg("accent", args.agent || "…")
+				+ theme.fg("dim", ` n=${args.n ?? 3} rounds=${args.rounds ?? 1}`)
+				+ `\n  ${theme.fg("dim", p)}`;
+			return new Text(t, 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const d = result.details as ConsensusDetails | undefined;
+			if (!d?.children?.length) {
+				const t = result.content[0];
+				return new Text(t?.type === "text" ? t.text : "(no output)", 0, 0);
+			}
+			const mdTheme = getMarkdownTheme();
+			const icon = d.failed ? theme.fg("error", "✗") : d.consensusReached ? theme.fg("success", "✓") : theme.fg("warning", "◐");
+			const head = `${icon} ${theme.fg("toolTitle", theme.bold("consensus "))}${theme.fg("accent", `${d.agent} ×${d.n}`)}${theme.fg("dim", ` · round ${d.roundsUsed}/${d.rounds} · ${d.consensusReached ? "consensus" : "divided"}`)}`;
+			const u = fmtUsage(d.usage, d.resolvedModel);
+			if (!expanded) {
+				let t = head;
+				if (u) t += `\n${theme.fg("dim", u)}`;
+				const plan = d.mergedPlan || "(no merged output)";
+				const allLines = plan.split("\n");
+				t += `\n${theme.fg("toolOutput", allLines.slice(0, 12).join("\n"))}`;
+				if (allLines.length > 12) t += theme.fg("muted", "\n… (Ctrl+O for the full result)");
+				return new Text(t, 0, 0);
+			}
+			const c = new Container();
+			c.addChild(new Text(head, 0, 0));
+			if (u) c.addChild(new Text(theme.fg("dim", u), 0, 0));
+			c.addChild(new Spacer(1));
+			c.addChild(new Text(theme.fg("muted", "─── Merged result ───"), 0, 0));
+			c.addChild(new Markdown(d.mergedPlan || "(none)", 0, 0, mdTheme));
+			c.addChild(new Spacer(1));
+			c.addChild(new Text(theme.fg("muted", "─── Dissent notes ───"), 0, 0));
+			c.addChild(new Text(theme.fg("dim", d.dissent || "None."), 0, 0));
+			const failedChildren = d.children.filter((r) => isFailedResult(r));
+			if (failedChildren.length) {
+				c.addChild(new Spacer(1));
+				c.addChild(new Text(theme.fg("error", `Failed children: ${failedChildren.length}`), 0, 0));
+			}
+			return c;
 		},
 	});
 
