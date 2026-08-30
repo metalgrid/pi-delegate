@@ -6,7 +6,7 @@
  *
  * Modes:
  *   - Single: { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent, task, model? }, ...] } (up to 4 concurrent)
+ *   - Parallel: { tasks: [{ agent, task, model?, thinking? }, ...] } (up to 4 concurrent)
  *   - Background: add { background: true } to return a job ID immediately
  *
  * Extensions & Skills:
@@ -14,7 +14,7 @@
  *   - Nested delegation is background-only and capped at depth 2
  *
  * Agents are markdown files in ~/.pi/agent/agents/ with frontmatter:
- *   name, description, tier (fast|standard|heavy), tools, model (optional override)
+ *   name, description, tier (fast|standard|heavy), tools, model, thinking (optional overrides)
  */
 
 import { spawn } from "node:child_process";
@@ -45,10 +45,12 @@ const COLLAPSED_OUTCOME_CAP_BYTES = 2 * 1024;
 const DELEGATE_DEPTH_ENV = "PI_DELEGATE_DEPTH";
 const MAX_DELEGATION_DEPTH = 2;
 const BUNDLED_AGENT_FILES = ["architect.md", "scout.md", "worker.md"] as const;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 type Tier = "fast" | "standard" | "heavy";
+type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 interface AgentConfig {
 	name: string;
@@ -56,6 +58,7 @@ interface AgentConfig {
 	tier: Tier;
 	tools?: string[];
 	model?: string; // explicit override
+	thinking?: ThinkingLevel; // explicit override
 	systemPrompt: string;
 }
 
@@ -80,6 +83,7 @@ interface TaskResult {
 	childId?: string;
 	exitCode: number;
 	resolvedModel: string;
+	thinking?: string;
 	messages: any[];
 	stderr: string;
 	usage: UsageStats;
@@ -96,6 +100,7 @@ interface ResolvedTask {
 	agent: string;
 	task: string;
 	model: string;
+	thinking?: ThinkingLevel;
 	cwd: string;
 	childId?: string;
 }
@@ -125,7 +130,14 @@ function getDelegateDepth(): number {
 	return Number.isFinite(depth) && depth >= 0 ? depth : 0;
 }
 
-function makePendingResult(agent: string, task: string, cwd: string, resolvedModel = "", childId?: string): TaskResult {
+function makePendingResult(
+	agent: string,
+	task: string,
+	cwd: string,
+	resolvedModel = "",
+	childId?: string,
+	thinking?: string,
+): TaskResult {
 	return {
 		agent,
 		task,
@@ -133,6 +145,7 @@ function makePendingResult(agent: string, task: string, cwd: string, resolvedMod
 		childId,
 		exitCode: -1,
 		resolvedModel,
+		thinking,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
@@ -184,12 +197,15 @@ function discoverAgents(): AgentConfig[] {
 			.filter(Boolean);
 
 		const tier = frontmatter.tier;
+		const rawThinking = frontmatter.thinking?.trim().toLowerCase();
+		const thinking = THINKING_LEVELS.find((level) => level === rawThinking);
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tier: tier === "fast" || tier === "heavy" ? tier : "standard",
 			tools: tools?.length ? tools : undefined,
 			model: frontmatter.model || undefined,
+			thinking,
 			systemPrompt: body.trim(),
 		});
 	}
@@ -311,6 +327,11 @@ function fmtUsage(u: UsageStats, model?: string): string {
 	if (u.cost) p.push(`$${u.cost.toFixed(4)}`);
 	if (model) p.push(model);
 	return p.join(" ");
+}
+
+function fmtModelLabel(r: TaskResult): string {
+	if (!r.resolvedModel) return r.thinking ?? "";
+	return r.thinking ? `${r.resolvedModel}:${r.thinking}` : r.resolvedModel;
 }
 
 function shortPath(p: string): string {
@@ -747,6 +768,7 @@ async function runAgent(
 	agentName: string,
 	task: string,
 	modelId: string,
+	thinking: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: any) => void) | undefined,
 	makeDetails: (results: TaskResult[]) => DelegateDetails,
@@ -764,6 +786,7 @@ async function runAgent(
 			childId,
 			exitCode: 1,
 			resolvedModel: modelId,
+			thinking,
 			messages: [],
 			stderr: `Unknown agent "${agentName}". Available: ${names}`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
@@ -774,6 +797,7 @@ async function runAgent(
 	// background children can receive steering messages while they are active.
 	const args = ["--mode", "rpc", "--no-session"];
 	if (modelId) args.push("--model", modelId);
+	if (thinking) args.push("--thinking", thinking);
 	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
 
 	let tmpDir: string | null = null;
@@ -784,6 +808,7 @@ async function runAgent(
 		childId,
 		exitCode: -1,
 		resolvedModel: modelId,
+		thinking,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
@@ -982,10 +1007,16 @@ function resolveChildCwd(parentCwd: string, requested?: string): { cwd?: string;
 
 // ─── Tool parameter schema ──────────────────────────────────────────────────
 
+const ThinkingLevelParam = Type.Union(
+	THINKING_LEVELS.map((level) => Type.Literal(level)),
+	{ description: "Thinking level: off, minimal, low, medium, high, xhigh, max. Without it the child starts at pi's configured startup thinking level." },
+);
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Agent name" }),
 	task: Type.String({ description: "Task description" }),
 	model: Type.Optional(Type.String({ description: "Model override for this task (e.g. 'provider/model-id')." })),
+	thinking: Type.Optional(ThinkingLevelParam),
 	cwd: Type.Optional(Type.String({ description: "Working directory for this child; overrides the invocation cwd." })),
 });
 
@@ -994,6 +1025,7 @@ const DelegateParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task for single mode" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Tasks for parallel mode; runs up to 4 concurrently and queues the rest" })),
 	model: Type.Optional(Type.String({ description: "Default model override for this invocation (e.g. 'provider/model-id')." })),
+	thinking: Type.Optional(ThinkingLevelParam),
 	cwd: Type.Optional(Type.String({ description: "Default child working directory; relative paths resolve from the parent cwd." })),
 	background: Type.Optional(Type.Boolean({ description: "Start work in the background and return a job ID immediately." })),
 });
@@ -1052,6 +1084,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task) or parallel (tasks array, max 4 concurrent; extra tasks are queued).",
 			"Each parallel task may specify its own model; a top-level model is the default for tasks without one.",
+			"thinking may be set per task or top-level (off|minimal|low|medium|high|xhigh|max); without it children start at pi's configured default thinking level, not the parent's current level.",
 			"Set background: true to start work without blocking; it returns a job ID and auto-reports completion to the parent session.",
 			"Nested delegation is background-only and capped at two levels.",
 		].join(" "),
@@ -1061,6 +1094,7 @@ export default function (pi: ExtensionAPI) {
 			"Use scout for quick codebase lookups, worker for code changes, architect for deep analysis.",
 			"Use parallel mode when multiple tasks are independent; tasks beyond the concurrency limit are queued.",
 			"Set tasks[].model to choose a model for a specific parallel task; use top-level model as the batch default.",
+			"Set thinking for tasks that need more or less reasoning effort; per-task thinking overrides the top-level value.",
 			"After starting delegate with background: true, do not poll with delegate_status, bash sleep, wait loops, or repeated status checks. Continue independent work or end the response; the completion message will automatically trigger a new turn.",
 		],
 		parameters: DelegateParams,
@@ -1082,6 +1116,12 @@ export default function (pi: ExtensionAPI) {
 				if (defaultModel) return defaultModel;
 				const agent = agents.find((candidate) => candidate.name === agentName);
 				return agent?.model || (agent ? tierModel.get(agent.tier) : undefined) || fallback;
+			}
+			const defaultThinking = params.thinking;
+			function thinkingFor(agentName: string, taskThinking?: ThinkingLevel): ThinkingLevel | undefined {
+				if (taskThinking) return taskThinking;
+				if (defaultThinking) return defaultThinking;
+				return agents.find((candidate) => candidate.name === agentName)?.thinking;
 			}
 
 			const hasSingle = Boolean(params.agent && params.task);
@@ -1111,7 +1151,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const rawTasks = hasSingle
-				? [{ agent: params.agent!, task: params.task!, model: undefined, cwd: undefined }]
+				? [{ agent: params.agent!, task: params.task!, model: undefined, thinking: undefined, cwd: undefined }]
 				: params.tasks!;
 			const tasks: ResolvedTask[] = [];
 			for (const task of rawTasks) {
@@ -1128,13 +1168,14 @@ export default function (pi: ExtensionAPI) {
 					agent: task.agent,
 					task: task.task,
 					model: modelFor(task.agent, task.model),
+					thinking: thinkingFor(task.agent, task.thinking),
 					cwd: resolved.cwd,
 				});
 			}
 
 			const makeInitialResults = (withChildIds: boolean, jobId?: string) =>
 				tasks.map((task, index) =>
-					makePendingResult(task.agent, task.task, task.cwd, task.model, withChildIds ? `${jobId}:${index + 1}` : undefined),
+					makePendingResult(task.agent, task.task, task.cwd, task.model, withChildIds ? `${jobId}:${index + 1}` : undefined, task.thinking),
 				);
 
 			const runTask = async (
@@ -1145,14 +1186,14 @@ export default function (pi: ExtensionAPI) {
 				onSettled?: () => void,
 			): Promise<TaskResult> => {
 				try {
-					const result = await runAgent(task.cwd, agents, task.agent, task.task, task.model, runSignal, (partial: any) => {
+					const result = await runAgent(task.cwd, agents, task.agent, task.task, task.model, task.thinking, runSignal, (partial: any) => {
 						const update = partial.details?.results[0] as TaskResult | undefined;
 						if (update) onTaskUpdate(update);
 					}, (results) => mkDetails(results), task.childId, onReady, onSettled);
 					onTaskUpdate(result);
 					return result;
 				} catch (error) {
-					const failed = makePendingResult(task.agent, task.task, task.cwd, task.model, task.childId);
+					const failed = makePendingResult(task.agent, task.task, task.cwd, task.model, task.childId, task.thinking);
 					failed.exitCode = 1;
 					failed.errorMessage = error instanceof Error ? error.message : String(error);
 					onTaskUpdate(failed);
@@ -1285,6 +1326,7 @@ export default function (pi: ExtensionAPI) {
 			if (tasks?.length) {
 				let t = theme.fg("toolTitle", theme.bold("delegate ")) + theme.fg("accent", `parallel (${tasks.length})`);
 				if (args.background) t += theme.fg("warning", " background");
+				if (args.thinking) t += theme.fg("dim", ` thinking:${args.thinking}`);
 				for (const task of tasks.slice(0, 3)) {
 					const p = task.task.length > 40 ? task.task.slice(0, 40) + "…" : task.task;
 					t += `\n  ${theme.fg("accent", task.agent)}${theme.fg("dim", ` ${p}`)}`;
@@ -1295,7 +1337,8 @@ export default function (pi: ExtensionAPI) {
 			const name = args.agent || "…";
 			const p = args.task ? (args.task.length > 60 ? args.task.slice(0, 60) + "…" : args.task) : "…";
 			const background = args.background ? theme.fg("warning", " background") : "";
-			return new Text(theme.fg("toolTitle", theme.bold("delegate ")) + theme.fg("accent", name) + background + `\n  ${theme.fg("dim", p)}`, 0, 0);
+			const thinking = args.thinking ? theme.fg("dim", ` thinking:${args.thinking}`) : "";
+			return new Text(theme.fg("toolTitle", theme.bold("delegate ")) + theme.fg("accent", name) + background + thinking + `\n  ${theme.fg("dim", p)}`, 0, 0);
 		},
 
 		// ── Render result ──────────────────────────────────────────────────
@@ -1336,7 +1379,8 @@ export default function (pi: ExtensionAPI) {
 					const c = new Container();
 					let h = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
 					if (details.background) h += theme.fg("warning", ` [${details.background.id}]`);
-					if (r.resolvedModel) h += theme.fg("dim", ` → ${r.resolvedModel}`);
+					const modelLabel = fmtModelLabel(r);
+					if (modelLabel) h += theme.fg("dim", ` → ${modelLabel}`);
 					if (failed && r.stopReason) h += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					c.addChild(new Text(h, 0, 0));
 					if (failed && r.errorMessage) c.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
@@ -1366,7 +1410,8 @@ export default function (pi: ExtensionAPI) {
 				// Collapsed: final outcome/status only. Expand to inspect child transcript.
 				let t = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
 				if (details.background) t += theme.fg("warning", ` [${details.background.id}]`);
-				if (r.resolvedModel) t += theme.fg("dim", ` → ${r.resolvedModel}`);
+				const modelLabel = fmtModelLabel(r);
+				if (modelLabel) t += theme.fg("dim", ` → ${modelLabel}`);
 				const outcomeColor = running ? "muted" : failed ? "error" : "toolOutput";
 				t += `\n${theme.fg(outcomeColor, getCollapsedOutcome(r))}`;
 				const u = fmtUsage(r.usage);
@@ -1399,7 +1444,7 @@ export default function (pi: ExtensionAPI) {
 					c.addChild(new Spacer(1));
 					c.addChild(
 						new Text(
-							`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${ri}${theme.fg("dim", ` → ${r.resolvedModel}`)}`,
+							`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${ri}${theme.fg("dim", ` → ${fmtModelLabel(r)}`)}`,
 							0,
 							0,
 						),
@@ -1435,7 +1480,7 @@ export default function (pi: ExtensionAPI) {
 				const rFailed = isFailedResult(r);
 				const ri = rRunning ? theme.fg("warning", "⏳") : rFailed ? theme.fg("error", "✗") : theme.fg("success", "✓");
 				const outcomeColor = rRunning ? "muted" : rFailed ? "error" : "toolOutput";
-				t += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${ri}${theme.fg("dim", ` → ${r.resolvedModel}`)}`;
+				t += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${ri}${theme.fg("dim", ` → ${fmtModelLabel(r)}`)}`;
 				t += `\n${theme.fg(outcomeColor, getCollapsedOutcome(r))}`;
 			}
 			if (!isRunning) {

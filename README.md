@@ -11,6 +11,7 @@ Each subagent runs as a separate `pi` process in the parent's working directory.
 - Additional agent profiles defined as Markdown files
 - Automatic model selection with `fast`, `standard`, and `heavy` tiers
 - Per-agent, per-task, and per-invocation model overrides
+- Per-agent, per-task, and per-invocation thinking-level overrides
 - Per-invocation and per-task working-directory overrides for git worktrees
 - Parallel execution with up to four concurrent agents
 - Background jobs that report back to the parent session automatically and accept targeted steering
@@ -77,6 +78,7 @@ Supported fields:
 | `tier` | no | `fast`, `standard`, or `heavy`; defaults to `standard`. |
 | `tools` | no | Comma-separated pi tools available to the child. If omitted, pi's defaults apply. |
 | `model` | no | Fixed `provider/model-id` override for this agent. |
+| `thinking` | no | Fixed thinking level for this agent: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
 
 The Markdown body is appended to the child pi process's system prompt. Agent names must be unique.
 
@@ -91,6 +93,17 @@ The model is chosen in this order:
 5. The parent's current model
 
 The tier heuristic favors a cheaper non-reasoning model for `fast`, a median model for `standard`, and a high-ranked reasoning model for `heavy`. Set an explicit model whenever deterministic routing matters.
+
+### Thinking level
+
+Children run as fresh processes and never inherit the parent's current thinking level. The child's thinking level is chosen in this order:
+
+1. A level set on an individual parallel task
+2. The invocation's top-level `thinking`
+3. The agent profile's `thinking`
+4. Pi's configured startup thinking level (`defaultThinkingLevel` / `modelThinkingLevels` in settings)
+
+Levels match pi's `--thinking` flag: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. As a shorthand, a `:<level>` suffix on a `model` value (for example `provider/model-id:high`) is also accepted because model values pass through to `--model` unchanged.
 
 ## Use
 
@@ -131,14 +144,17 @@ Parallel tasks:
       "agent": "worker",
       "task": "Implement the approved API change",
       "cwd": "/repo/.worktrees/api-change",
-      "model": "provider/model-id"
+      "model": "provider/model-id",
+      "thinking": "high"
     }
   ],
   "background": true
 }
 ```
 
-Top-level `model` and `cwd` are defaults for tasks without their own values. A relative `cwd` resolves from the parent session's directory and must exist. Parallel batches run at most four children concurrently; additional tasks are queued.
+Top-level `model`, `thinking`, and `cwd` are defaults for tasks without their own values. A relative `cwd` resolves from the parent session's directory and must exist. Parallel batches run at most four children concurrently; additional tasks are queued.
+
+Set `thinking` to pin a child's reasoning effort; per-task values override the top-level value. Without it, children start at pi's configured default thinking level.
 
 Background jobs automatically inject a completion message into the parent session and trigger a new turn. The parent agent should continue independent work or end its response instead of polling with `delegate_status`, `sleep`, or wait loops.
 
