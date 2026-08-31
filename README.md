@@ -225,6 +225,14 @@ Round 0 spawns `n` independent solvers (2–5, default 3). An arbiter child then
 
 The parent receives only the merged result and the dissent notes; per-child transcripts stay in the tool details. Each round costs `n + 1` model calls, so keep `n` small unless the stakes justify more. `models` cycles per solver — diverse models make consensus more meaningful. `thinking` applies to solvers and the arbiter. `cwd` sets the working directory for all children. Consensus runs in the foreground only and cannot run inside a delegated child session.
 
+Slash command equivalent:
+
+```text
+/consensus [--agent <name>] [--n <2-5>] [--rounds <1-3>] [--thinking <level>] <task>
+```
+
+Defaults are `architect`, `n 3`, `rounds 1`. The command instructs the agent to invoke the tool with those parameters, so the call and its result stay visible in the transcript.
+
 ## How it works
 
 Children inherit the parent's environment, normal extension discovery, and skill discovery, and run in the resolved child working directory. They run in RPC mode without saving a session so background children can receive steering messages. The selected agent prompt is written to a permission-restricted temporary file and passed through `--append-system-prompt`; the file is removed when the child exits.

@@ -9,6 +9,7 @@
  *   - Parallel: { tasks: [{ agent, task, model?, thinking? }, ...] } (up to 4 concurrent)
  *   - Background: add { background: true } to return a job ID immediately
  *   - Consensus: { agent, task, n, rounds } — N solvers + arbiter merge, debate rounds while divided
+ *   - /consensus slash command wraps the consensus tool with defaults (architect, n 3, rounds 1)
  *
  * Extensions & Skills:
  *   - Child processes keep normal extension and skill auto-discovery enabled
@@ -1931,6 +1932,44 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: truncateForParent(text) }],
 				details: { jobs: jobs.map(toDetails) },
 			};
+		},
+	});
+
+	pi.registerCommand("consensus", {
+		description: "Run multi-agent consensus on a task (/consensus [--agent <name>] [--n <2-5>] [--rounds <1-3>] [--thinking <level>] <task>)",
+		handler: async (args, ctx) => {
+			const usage = "Usage: /consensus [--agent <name>] [--n <2-5>] [--rounds <1-3>] [--thinking <level>] <task>";
+			let agent = "architect";
+			let n = 3;
+			let rounds = 1;
+			let thinking = "";
+			const rest: string[] = [];
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			for (let i = 0; i < tokens.length; i++) {
+				const token = tokens[i]!;
+				if (token === "--agent") agent = tokens[++i] ?? "";
+				else if (token === "--n") n = Number.parseInt(tokens[++i] ?? "", 10);
+				else if (token === "--rounds") rounds = Number.parseInt(tokens[++i] ?? "", 10);
+				else if (token === "--thinking") thinking = tokens[++i] ?? "";
+				else rest.push(token);
+			}
+			const task = rest.join(" ").trim();
+			if (!task || !agent || !Number.isFinite(n) || !Number.isFinite(rounds)) {
+				ctx.ui.notify(usage, "warning");
+				return;
+			}
+			n = Math.min(5, Math.max(2, n));
+			rounds = Math.min(3, Math.max(1, rounds));
+
+			const parts = [`agent ${JSON.stringify(agent)}`, `n ${n}`, `rounds ${rounds}`];
+			if (thinking) parts.push(`thinking ${JSON.stringify(thinking)}`);
+			const message = `Call the consensus tool now with exactly these parameters: ${parts.join(", ")}, task ${JSON.stringify(task)}. After it completes, report the merged result, the dissent notes, and the total cost.`;
+			try {
+				pi.sendUserMessage(message);
+			} catch {
+				// The agent is mid-turn; queue the instruction instead of dropping it.
+				pi.sendUserMessage(message, { deliverAs: "steer" });
+			}
 		},
 	});
 
