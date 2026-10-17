@@ -6,8 +6,8 @@ Each subagent runs as a separate `pi` process in the parent's working directory.
 
 ## Features
 
-- Three bundled agent profiles (`scout`, `architect`, and `worker`)
-- A `team-lead` skill for plan-driven, review-gated multi-agent delivery
+- Five bundled agent profiles (`scout`, `architect`, `worker`, `interrogator`, and `comment-critic`)
+- A `team-lead` skill for plan-driven, review-gated multi-agent delivery, with task routing to investigation, bug-fix, and refactoring playbooks
 - Additional agent profiles defined as Markdown files
 - Automatic model selection with `fast`, `standard`, and `heavy` tiers
 - Per-agent, per-task, and per-invocation model overrides
@@ -41,11 +41,11 @@ pi remove git:github.com/metalgrid/pi-delegate
 > [!WARNING]
 > Pi extensions and delegated agents run with your user permissions. Review this extension and limit each agent's tools to operations you trust.
 
-On first load, the extension copies its bundled `scout`, `architect`, and `worker` profiles into `~/.pi/agent/agents/`. Existing files are never overwritten, so local customizations remain intact.
+On first load, the extension copies its bundled profiles into `~/.pi/agent/agents/`. Existing files are never overwritten, so local customizations remain intact.
 
 ## Team-lead workflow
 
-The package includes a `team-lead` skill that coordinates complex work through planning, task-isolation analysis, lead-managed git worktrees, background implementation delegates, review/fix loops, a senior final review, and sensible history squashing.
+The package includes a `team-lead` skill that coordinates complex work through planning, task-isolation analysis, lead-managed git worktrees, background implementation delegates, review/fix loops, a senior final review, and sensible history squashing. The skill first routes each task: read-only questions go to an investigation playbook, defects to a reproduce-first bug-fix playbook, and behavior-preserving changes to a refactoring playbook, each read on demand from `skills/team-lead/playbooks/`. Non-trivial diffs also get an adversarial pass from the `interrogator` profile and a comment pass from `comment-critic` during final review.
 
 Invoke it explicitly with:
 
