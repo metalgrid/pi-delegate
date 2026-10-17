@@ -23,6 +23,8 @@ Match the task to exactly one row and read that playbook before Stage 1. Read no
 
 When a playbook lets you skip a stage or a review loop, record the skip and its one-line reason in the plan.
 
+If work materially changes class mid-task (for example, a refactoring step needs a behavior change), stop, return to this stage, and re-route: read the newly matched playbook instead of the old one and record the reclassification in the plan.
+
 ## Operating Rules
 
 1. Read applicable project instructions and load relevant skills before acting. Use the git-specific skill for every git operation when one is available.
