@@ -47,7 +47,7 @@ const COLLAPSED_OUTCOME_CAP_BYTES = 2 * 1024;
 const DELEGATE_DEPTH_ENV = "PI_DELEGATE_DEPTH";
 const MAX_DELEGATION_DEPTH = 2;
 const CONSENSUS_PROPOSAL_CAP_BYTES = 8 * 1024;
-const BUNDLED_AGENT_FILES = ["architect.md", "scout.md", "worker.md"] as const;
+const BUNDLED_AGENT_FILES = ["architect.md", "comment-critic.md", "interrogator.md", "scout.md", "worker.md"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
