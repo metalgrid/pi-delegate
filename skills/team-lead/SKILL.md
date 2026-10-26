@@ -54,7 +54,7 @@ If work materially changes class mid-task (for example, a refactoring step needs
 5. Resolve preference-dependent or high-impact choices with the user and obtain approval before implementation.
 6. Lock the approved plan. If later evidence requires a material change, pause, revise explicitly, repeat architectural review, and regain approval.
 
-A plan is ready only when every task has: a clear owner profile, dependencies, affected area, acceptance criteria, verification, and integration strategy.
+A plan is ready only when every task has: a clear owner profile, dependencies, affected area, concurrency class with its recorded reason, acceptance criteria, verification, and integration strategy.
 
 ## Stage 2: Prepare
 
@@ -65,6 +65,22 @@ Classify implementation tasks before delegation:
 - **Shared-code:** tasks touch the same files, interfaces, schemas, generated outputs, dependency manifests, migrations, or tightly coupled behavior.
 
 Also account for git's shared index and branch state: multiple committing workers must not operate concurrently in the same checkout even when their source files are code-isolated. Use separate worktrees for concurrent commit-producing workers; otherwise run mutating tasks sequentially.
+
+Record the decision for every task in the plan before delegation:
+
+- Write each task's class and a one-line reason for sequential or parallel execution, for example `sequential: shares internal/store/schema.go`.
+- Treat a missing reason as a plan defect, not permission to run sequentially. Ask the architect to sharpen the task split until the reason is real.
+- When three or more mutating tasks are code-isolated, structure the plan for fan-out instead of combining them into one large task.
+
+### Fan-out structure
+
+When the plan supports parallel implementation, order tasks in three tiers and write the ordering into the plan:
+
+1. **Foundation task:** one worker first lands the shared interfaces, schemas, contracts, and constants that leaf tasks consume. No leaf task starts until the foundation is integrated.
+2. **Leaf tasks:** code-isolated tasks that build only on the foundation. Run them concurrently, each in its own worktree under Worktree Management Mode.
+3. **Integration:** the team lead integrates leaf branches in dependency order and reruns relevant checks after each integration.
+
+Handing one large task to a single worker is a deliberate exception. Record in the plan why the work could not be split into code-isolated units.
 
 Before implementation:
 
