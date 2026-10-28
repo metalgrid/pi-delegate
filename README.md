@@ -95,6 +95,20 @@ The model is chosen in this order:
 
 The tier heuristic favors a cheaper non-reasoning model for `fast`, a median model for `standard`, and a high-ranked reasoning model for `heavy`. Set an explicit model whenever deterministic routing matters.
 
+### Delegation model eligibility
+
+Run `/delegate:models` in interactive TUI mode to open a searchable checkbox modal for the chat models currently available from Pi's configured providers. Classifier and image-generation models are not included.
+
+- Type to search; use ↑/↓ to move and Space or Enter to toggle eligibility.
+- **Ctrl+S** saves; **Escape** cancels without writing changes.
+- `[x]` means eligible. All models start eligible, including newly discovered models.
+
+Selections are saved atomically in `<agent-dir>/delegate-models.json` (`~/.pi/agent/delegate-models.json` by default; honors `PI_CODING_AGENT_DIR`). Disabled `provider/model-id` identities remain saved even when their provider or model temporarily disappears. Invalid or unreadable preferences fail closed with an actionable error; repair or remove the file rather than silently resetting it.
+
+Eligibility applies to tier selection, the parent-model fallback, task/invocation/profile overrides, consensus solvers and their arbiter, and nested delegation. Explicit overrides must use an **exact, case-sensitive `provider/model-id`** from Pi's chat catalog, optionally followed by `:thinking`; bare IDs and fuzzy aliases are rejected. The child provider is pinned explicitly. A literal model ID containing a colon takes precedence over interpreting it as a thinking suffix.
+
+If no eligible model can be selected, delegation fails before launching a child instead of letting Pi choose an unapproved default. Preferences are reread for each invocation and immediately before each child launch, including queued children and later consensus rounds. Saving changes does not terminate already-running children. These preferences control this extension's selection, not arbitrary model calls or configuration changes made by other extensions.
+
 ### Thinking level
 
 Children run as fresh processes and never inherit the parent's current thinking level. The child's thinking level is chosen in this order:
@@ -252,6 +266,14 @@ Load the checkout directly:
 ```bash
 pi -e ./index.ts
 ```
+
+Run the focused regression suite with the installed Pi package (including its bundled `jiti` and peer packages):
+
+```bash
+PI_PACKAGE_DIR=/absolute/path/to/node_modules/@earendil-works/pi-coding-agent npm test
+```
+
+If those packages already resolve locally, `npm test` is sufficient. Tests use an isolated agent directory and a fake RPC child, never real credentials or paid model calls.
 
 A quick non-interactive load check is:
 
