@@ -38,6 +38,10 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { loadDisabled, modelKey, modelPolicy, saveDisabled, type ModelIdentity } from "./model-policy.ts";
+import { modelPicker } from "./model-picker.ts";
+
+const modelPreferencesFile = () => path.join(getAgentDir(), "delegate-models.json");
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -803,6 +807,7 @@ async function runAgent(
 	agentName: string,
 	task: string,
 	modelId: string,
+	catalog: ModelIdentity[],
 	thinking: string | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: ((partial: any) => void) | undefined,
@@ -828,10 +833,17 @@ async function runAgent(
 		};
 	}
 
+	// Recheck just before launching, including queued tasks and later consensus rounds.
+	modelPolicy(catalog, loadDisabled(modelPreferencesFile())).resolve(modelId);
+
 	// Keep normal extension and skill discovery enabled. RPC keeps stdin open so
 	// background children can receive steering messages while they are active.
 	const args = ["--mode", "rpc", "--no-session"];
-	if (modelId) args.push("--model", modelId);
+	// Pin the provider separately so Pi cannot reinterpret a provider-prefixed ID
+	// as a matching model on another provider.
+	const slash = modelId.indexOf("/");
+	if (slash < 1) throw new Error("Delegation requires an exact provider/model-id.");
+	args.push("--provider", modelId.slice(0, slash), "--model", modelId.slice(slash + 1));
 	if (thinking) args.push("--thinking", thinking);
 	if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
 
@@ -1128,6 +1140,7 @@ async function orchestrateConsensus(opts: {
 	n: number;
 	maxRounds: number;
 	solverModels: string[];
+	catalog: ModelIdentity[];
 	thinking?: string;
 	signal: AbortSignal | undefined;
 	onPhase?: (text: string, details: ConsensusDetails) => void;
@@ -1160,7 +1173,7 @@ async function orchestrateConsensus(opts: {
 	const viable = (rs: TaskResult[]) => rs.filter((r) => !isFailedResult(r) && proposalText(r));
 
 	const spawnJudge = async () => {
-		const judge = await runAgent(cwd, agents, agent, judgeTaskPrompt(task, texts), solverModels[0] ?? "", thinking, signal, undefined, () => undefined);
+		const judge = await runAgent(cwd, agents, agent, judgeTaskPrompt(task, texts), solverModels[0] ?? "", opts.catalog, thinking, signal, undefined, () => undefined);
 		children.push(judge);
 		return judge;
 	};
@@ -1169,7 +1182,7 @@ async function orchestrateConsensus(opts: {
 	const runSolvers = async (prompts: string[]) => {
 		generation++;
 		const results = await mapConcurrent(prompts, MAX_CONCURRENCY, (prompt, i) =>
-			runAgent(cwd, agents, agent, prompt, solverModels[i] ?? solverModels[0] ?? "", thinking, signal, undefined, () => undefined),
+			runAgent(cwd, agents, agent, prompt, solverModels[i] ?? solverModels[0] ?? "", opts.catalog, thinking, signal, undefined, () => undefined),
 		);
 		children.push(...results);
 		const ok = viable(results).map(proposalText);
@@ -1316,8 +1329,10 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const agents = discoverAgents();
-			const available = ctx.modelRegistry.getAvailable();
-			const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+			const disabled = loadDisabled(modelPreferencesFile());
+			const policy = modelPolicy(ctx.modelRegistry.getAll(), disabled);
+			const available = ctx.modelRegistry.getAvailable().filter((model) => !disabled.has(modelKey(model)));
+			const fallback = ctx.model && !disabled.has(modelKey(ctx.model)) ? modelKey(ctx.model) : "";
 			const extList = discoverExtensions(ctx.cwd);
 			const skillList = discoverSkills(ctx.cwd);
 			const tierModel = tierModelMap(available, fallback);
@@ -1379,7 +1394,7 @@ export default function (pi: ExtensionAPI) {
 				tasks.push({
 					agent: task.agent,
 					task: task.task,
-					model: modelFor(task.agent, task.model),
+					model: policy.resolve(modelFor(task.agent, task.model)),
 					thinking: thinkingFor(task.agent, task.thinking),
 					cwd: resolved.cwd,
 				});
@@ -1398,7 +1413,7 @@ export default function (pi: ExtensionAPI) {
 				onSettled?: () => void,
 			): Promise<TaskResult> => {
 				try {
-					const result = await runAgent(task.cwd, agents, task.agent, task.task, task.model, task.thinking, runSignal, (partial: any) => {
+					const result = await runAgent(task.cwd, agents, task.agent, task.task, task.model, ctx.modelRegistry.getAll(), task.thinking, runSignal, (partial: any) => {
 						const update = partial.details?.results[0] as TaskResult | undefined;
 						if (update) onTaskUpdate(update);
 					}, (results) => mkDetails(results), task.childId, onReady, onSettled);
@@ -1724,7 +1739,10 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const agents = discoverAgents();
-			const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+			const disabled = loadDisabled(modelPreferencesFile());
+			const policy = modelPolicy(ctx.modelRegistry.getAll(), disabled);
+			const available = ctx.modelRegistry.getAvailable().filter((model) => !disabled.has(modelKey(model)));
+			const fallback = ctx.model && !disabled.has(modelKey(ctx.model)) ? modelKey(ctx.model) : "";
 			const known = agents.find((a) => a.name === params.agent);
 			if (!known) {
 				const names = agents.map((a) => a.name).join(", ") || "none";
@@ -1740,8 +1758,10 @@ export default function (pi: ExtensionAPI) {
 			const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 			const n = clamp(Math.round(params.n ?? 3), 2, 5);
 			const maxRounds = clamp(Math.round(params.rounds ?? 1), 1, 3);
-			const defaultModel = known.model || tierModelMap(ctx.modelRegistry.getAvailable(), fallback).get(known.tier) || fallback;
-			const solverModels = Array.from({ length: n }, (_, i) => params.models?.[i]?.trim() || defaultModel);
+			const defaultModel = known.model || tierModelMap(available, fallback).get(known.tier) || fallback;
+			const solverModels = Array.from({ length: n }, (_, i) => policy.resolve(
+				(params.models?.length ? params.models[i % params.models.length]?.trim() : "") || defaultModel,
+			));
 			const thinking = params.thinking ?? known.thinking;
 
 			try {
@@ -1753,6 +1773,7 @@ export default function (pi: ExtensionAPI) {
 					n,
 					maxRounds,
 					solverModels,
+					catalog: ctx.modelRegistry.getAll(),
 					thinking,
 					signal,
 					onPhase: onUpdate ? (text, snap) => onUpdate({ content: [{ type: "text", text }], details: snap }) : undefined,
@@ -1969,6 +1990,30 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				// The agent is mid-turn; queue the instruction instead of dropping it.
 				pi.sendUserMessage(message, { deliverAs: "steer" });
+			}
+		},
+	});
+
+	pi.registerCommand("delegate:models", {
+		description: "Choose which chat models may be used for delegation",
+		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") {
+				ctx.ui.notify("/delegate:models requires interactive TUI mode.", "warning");
+				return;
+			}
+			try {
+				const file = modelPreferencesFile();
+				const disabled = loadDisabled(file);
+				const selection = await ctx.ui.custom<Set<string> | undefined>(
+					(tui, theme, _kb, done) => modelPicker(tui, theme, ctx.modelRegistry.getAvailable(), disabled, done),
+					{ overlay: true, overlayOptions: { anchor: "center", width: "92%", maxHeight: "85%", margin: 1 } },
+				);
+				if (selection !== undefined) {
+					saveDisabled(file, selection);
+					ctx.ui.notify("Delegation model preferences saved.", "info");
+				}
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
 		},
 	});
