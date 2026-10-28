@@ -8,6 +8,8 @@
   "type": "module",
   "files": [
     "index.ts",
+    "model-policy.ts",
+    "model-picker.ts",
     "agents",
     "skills",
     "README.md"
@@ -31,6 +33,9 @@
     "skills": [
       "./skills"
     ]
+  },
+  "scripts": {
+    "test": "node tests/models.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
